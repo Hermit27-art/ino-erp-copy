@@ -1,10 +1,15 @@
-# INO ERP: agent rules (always on)
+# INO Finance/Ledger: agent rules (always on)
 
 No frontmatter by design. Keep this file short. Detailed rules live in `.agents/rules/` and load on demand.
 
 ## What this is
 
-A single-company operations ERP (sales, purchasing, stock, receivables/payables, cash and bank accounts) plus a POS ("re-feel"). Frontend: React 19, Vite, Tailwind 4, Recharts 3, built into one HTML file and hosted in Google Apps Script. Backend: `Code_ERP.gs` with Google Sheets as the database. It is a portfolio project meant for international use.
+**INO Finance/Ledger** — Single-cabang finance & ledger app fed by JeKing POS CSV exports via a Go middleware, with manual entry as first-class citizen.
+- **Pipeline:** JeKing CSV → Go exe (stdlib, Win7/386) → Supabase RPC (idempotent upsert) → React app on Vercel
+- **Backend:** Supabase (PostgreSQL) — RLS, triggers, audit_log, General Ledger append-only
+- **Frontend:** React 19 + Vite + Tailwind 4 + Recharts 3, deployed on Vercel
+- **Auth:** Supabase Auth (email/password + magic link), RLS enforced
+- **Core principle:** Go output not guaranteed correct → **audit trail is truth**, not read-only replica. Manual entry = sumber `'manual'`. No hard deletes (void/aktif flag). GL append-only (edits = reversal + new entry).
 
 ## Source of truth
 
@@ -13,26 +18,28 @@ A single-company operations ERP (sales, purchasing, stock, receivables/payables,
 - Work only on items the PRD lists, in phase order, and one phase per session.
 - If a request is not in the PRD, say so and ask before building it.
 - If the PRD and the code disagree, report it. Do not silently pick one.
-- Respect the Decision Log. An empty answer means use the stated default and mark it `// DECISION-xx: default used`.
+- Respect the Decision Log (DEC-01 to DEC-10). Empty answer = use default, mark `// DECISION-xx: default used`.
 
 ## Hard rules
 
-1. **Never touch the production Sheet or deployment.** Work on a test copy only. Never run `resetSemuaData`, `runDummyCleanupMigration`, or `saveAll*` against real data.
-2. **The server is the source of truth.** The client sends intent. The server computes prices, totals, stock, balances, identity, IDs, and timestamps.
-3. **Every public Apps Script function starts with an auth and role check.** A function name without a trailing underscore is callable from any browser console.
-4. **No silent data loss.** No dropping unknown fields, no whole-table overwrite on hot paths, no unawaited saves, no optimistic UI without rollback.
-5. **No new dependency** unless the PRD allows it (`vitest`, and what the owner-approved dashboard template needs). List and justify each one in the commit message.
-6. **Do not rewrite `src/App.tsx`** (about 9,400 lines) and do not add `useState` to it. New logic goes in new modules; touch `App.tsx` only to wire things up.
-7. **No secrets, peppers, password hashes, or deployment URLs** in the repo, logs, or browser storage.
-8. **Stop and ask** when money or tax semantics are unclear, when a schema change affects existing data, before deleting files, before touching production, or when the PRD conflicts with itself.
+1. **Never touch production Supabase project.** Work on a local/dev Supabase instance only. Never run destructive migrations against prod.
+2. **The server (Supabase) is the source of truth.** Client sends intent via RPC. Supabase computes GL, stock, balances, IDs, timestamps, audit.
+3. **Every mutating RPC requires `SET LOCAL app.audit_reason = '...'`** before the operation. No UPDATE/DELETE on `audit_log` for any role.
+4. **No silent data loss.** No dropping unknown fields (RPC validates), no whole-table overwrite (replace all `saveAll*` with per-row upsert), no unawaited saves, no optimistic UI without rollback.
+5. **No new dependency** unless PRD allows it (`@supabase/supabase-js`, `vitest`, Go stdlib only). List and justify each in commit message.
+6. **Do not rewrite `src/App.tsx`** (~9,400 lines) and do not add `useState` to it. New logic goes in new modules; touch `App.tsx` only to wire things up.
+7. **No secrets, service_role keys, or Supabase URLs** in repo, logs, or browser storage. Use `.env.local` (gitignored) for anon key.
+8. **Stop and ask** when money/tax/stock semantics are unclear, when a schema change affects existing data, before deleting files, before touching production, or when PRD conflicts with itself.
+9. **Go exe: stdlib only, Go 1.20.x, GOARCH=386, GOOS=windows.** No cgo, no external deps. Binary < 10MB.
+10. **Idempotency is mandatory.** Every ingest uses `external_ref` + `hash_asli`. Re-running same CSV = no duplicate rows.
 
 ## Before you say "done"
 
-Run `npm run lint`, `npm run build`, and `npm test`, and exercise the changed behavior on the test copy. Then run the `pre-handoff-review` skill. State what you could not verify.
+Run `npm run lint`, `npm run build`, and `npm test`, and exercise the changed behavior on the dev Supabase instance. Then run the `pre-handoff-review` skill. State what you could not verify.
 
 ## Rules that load on demand
 
-`security-trust-boundary`, `google-apps-script`, `react-typescript`, `money-stock-integrity`, `ui-dashboard-i18n`, `testing-and-done`, `git-and-reporting`. Skills: `execute-prd-phase`, `pre-handoff-review`.
+`security-trust-boundary`, `supabase-rls`, `audit-trail`, `money-stock-integrity`, `ui-dashboard-i18n`, `testing-and-done`, `git-and-reporting`, `go-stdlib`. Skills: `execute-migration-phase`, `pre-handoff-review`.
 
 ## Language
 

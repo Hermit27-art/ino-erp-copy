@@ -23,6 +23,7 @@ export interface PurchaseOrderTabProps {
   setSelectedPo: (v: any) => void;
   setPoActionForm: (v: any) => void;
   handleVoidPO: (id: string) => void;
+  handleReturPO: (id: string) => void;
   handlePoItemChange: (index: number, sku: string, qty: number, harga: number) => void;
   handleRemovePoItem: (index: number) => void;
   handleAddPoItem: () => void;
@@ -40,7 +41,8 @@ export const PurchaseOrderTab: React.FC<PurchaseOrderTabProps> = ({
   poForm, setPoForm,
   searchPoQuery, setSearchPoQuery,
   filteredPOs, setSelectedPo, setPoActionForm,
-  handleVoidPO, handlePoItemChange, handleRemovePoItem, handleAddPoItem, handleSavePO, isSavingPO
+  handleVoidPO, handleReturPO,
+  handlePoItemChange, handleRemovePoItem, handleAddPoItem, handleSavePO, isSavingPO
 }) => {
   return (
     <div className="space-y-6">

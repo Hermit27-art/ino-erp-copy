@@ -106,6 +106,141 @@ function auditSheetHeaders() {
   return report;
 }
 
+/**
+ * D4 — Round-trip test: save and load each entity type to verify schema integrity.
+ * Returns a report with pass/fail status for each entity.
+ */
+function testSchemaRoundTrip() {
+  const report = {
+    timestamp: new Date().toISOString(),
+    results: {},
+    overall: 'PASS'
+  };
+
+  // Test data for each entity type (minimal valid data)
+  const testData = {
+    Products: { sku: 'TEST-SKU-' + Date.now(), kategori: 'Test', nama: 'Test Product', satuan: 'PCS', hargaJual: 1000, hpp: 500, safetyStock: 0, stok: 10, status: 'Aktif', supplierUtama: '', lokasi: '', masaSimpan: 0, catatan: '' },
+    Customers: { nama: 'Test Customer', kontak: 'Test', email: 'test@test.com', telp: '08123456789', alamat: 'Test Address', piutang: 0 },
+    Suppliers: { nama: 'Test Supplier', kontak: 'Test', email: 'test@supplier.com', telp: '08123456789', alamat: 'Test Address', hutang: 0 },
+    CashLedger: { tanggal: new Date().toISOString().split('T')[0], ref: 'TEST-RT', keterangan: 'Round-trip test', kategori: 'Test', debit: 100, kredit: 0, saldo: 100, akun: 'Kas Tunai', metode: 'Tunai' },
+    InventoryLog: { tanggal: new Date().toISOString().split('T')[0], sku: 'TEST-SKU', nama: 'Test', tipe: 'Opname', qtySistem: 10, qtyFisik: 10, selisih: 0, satuan: 'PCS', HPP: 500, subtotal: 5000, catatan: 'Test', operator: 'Test' },
+    Settings: { key: 'TEST_KEY', value: 'test_value' },
+    CashAccounts: { nama: 'Test Account', jenis: 'Kas', aktif: true },
+    PaymentMethods: { nama: 'Test Method', akun: 'Kas Tunai', aktif: true },
+    VoidLog: { tanggal: new Date().toISOString().split('T')[0], docType: 'SO', docId: 'TEST', kasir: 'Test', nilai: 100, alasan: 'Test', timestamp: new Date().toISOString() },
+    Platforms: { nama: 'Test Platform', aktif: true }
+  };
+
+  // PK fields for each entity
+  const pkFields = {
+    Products: 'sku',
+    Customers: 'id',
+    Suppliers: 'id',
+    PurchaseOrders: 'id',
+    SalesOrders: 'id',
+    CashLedger: 'id',
+    InventoryLog: 'tanggal', // no single PK, use composite
+    Settings: 'key',
+    CashAccounts: 'nomor',
+    PaymentMethods: 'id',
+    VoidLog: 'id',
+    Platforms: 'nama'
+  };
+
+  for (const sheetName in testData) {
+    try {
+      const item = { ...testData[sheetName] };
+      const pkField = pkFields[sheetName];
+
+      // Skip tables with composite PK or complex structure
+      if (!pkField || sheetName === 'InventoryLog') {
+        report.results[sheetName] = { status: 'SKIPPED', reason: 'Composite PK or complex structure' };
+        continue;
+      }
+
+      // For entities with auto-generated ID, let server generate it
+      if (sheetName === 'Customers' || sheetName === 'Suppliers' || sheetName === 'CashLedger' || sheetName === 'VoidLog' || sheetName === 'PaymentMethods') {
+        // Use create* functions for these
+        const createFunc = 'create' + sheetName.replace('Ledger', 'Entry').replace('VoidLog', 'CashEntry');
+        if (typeof this[createFunc] === 'function') {
+          const result = this[createFunc]('test-token', item);
+          if (!result || !result.id) {
+            report.results[sheetName] = { status: 'FAIL', reason: 'Create returned no ID' };
+            report.overall = 'FAIL';
+            continue;
+          }
+          item.id = result.id;
+        }
+      }
+
+      // For test purposes, we'll just use saveItemToSheet_ directly
+      // Note: In real usage, create* functions handle ID generation
+      if (sheetName === 'Customers') item.id = 'CUST-TEST-' + Date.now();
+      else if (sheetName === 'Suppliers') item.id = 'SUP-TEST-' + Date.now();
+      else if (sheetName === 'CashLedger') item.id = 'CSH-TEST-' + Date.now();
+      else if (sheetName === 'VoidLog') item.id = 'VOID-TEST-' + Date.now();
+      else if (sheetName === 'PaymentMethods') item.id = 'PM-TEST-' + Date.now();
+      else if (sheetName === 'CashAccounts') item.nomor = 'ACC-TEST-' + Date.now();
+
+      // Save
+      saveItemToSheet_(sheetName, item, pkField);
+
+      // Load back
+      const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(sheetName);
+      const values = sheet.getDataRange().getValues();
+      const headers = values[0];
+      const pkIndex = headers.indexOf(pkField);
+      let found = false;
+      let loadedItem = null;
+      for (let i = 1; i < values.length; i++) {
+        if (values[i][pkIndex] == item[pkField]) {
+          loadedItem = {};
+          headers.forEach((h, idx) => { loadedItem[h] = values[i][idx]; });
+          found = true;
+          break;
+        }
+      }
+
+      if (!found) {
+        report.results[sheetName] = { status: 'FAIL', reason: 'Item not found after save' };
+        report.overall = 'FAIL';
+        continue;
+      }
+
+      // Compare (only check fields that were in test data)
+      let match = true;
+      const mismatches = [];
+      for (const key in item) {
+        const expected = item[key];
+        const actual = loadedItem[key];
+        // Handle number/string comparison
+        if (String(expected) !== String(actual)) {
+          match = false;
+          mismatches.push({ field: key, expected, actual });
+        }
+      }
+
+      if (match) {
+        report.results[sheetName] = { status: 'PASS' };
+      } else {
+        report.results[sheetName] = { status: 'FAIL', reason: 'Data mismatch', mismatches };
+        report.overall = 'FAIL';
+      }
+
+      // Cleanup test data
+      deleteItemFromSheet_(sheetName, item[pkField], pkField);
+
+    } catch (e) {
+      report.results[sheetName] = { status: 'ERROR', reason: e.message };
+      report.overall = 'FAIL';
+    }
+  }
+
+  Logger.log("=== HASIL ROUND-TRIP TEST (D4) ===");
+  Logger.log(JSON.stringify(report, null, 2));
+  return report;
+}
+
 // ----------------------------------------------------
 // SESSION & AUTH MANAGEMENT (S1, S4, S5)
 // ----------------------------------------------------
@@ -814,17 +949,28 @@ function getSheetData_(sheetName) {
 function saveItemToSheet_(sheetName, item, pkField) {
   const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(sheetName);
   if (!sheet) throw new Error("Sheet '" + sheetName + "' tidak ditemukan.");
-  
+
   const values = sheet.getDataRange().getValues();
   if (values.length === 0) throw new Error("Sheet '" + sheetName + "' kosong, belum ada header.");
-  
+
   const headers = values[0];
+
+  // D4 — Runtime validation: reject foreign fields not in SCHEMA
+  if (SCHEMA[sheetName]) {
+    const allowedFields = new Set(SCHEMA[sheetName]);
+    const itemKeys = Object.keys(item);
+    const foreignKeys = itemKeys.filter(k => !allowedFields.has(k));
+    if (foreignKeys.length > 0) {
+      throw new Error("Foreign field(s) not allowed in '" + sheetName + "': " + foreignKeys.join(', ') + ". Allowed: " + allowedFields.size + " fields.");
+    }
+  }
+
   const writeItem = parseNumbers_(item); // Ensure numbers are written explicitly
   const rowData = headers.map(h => writeItem[h] === undefined ? "" : writeItem[h]);
-  
+
   const pkIndex = headers.indexOf(pkField);
   if (pkIndex === -1) throw new Error("Primary key '" + pkField + "' tidak ditemukan di header '" + sheetName + "'.");
-  
+
   let found = false;
   for (let i = 1; i < values.length; i++) {
     if (values[i][pkIndex] == writeItem[pkField]) {
@@ -834,7 +980,7 @@ function saveItemToSheet_(sheetName, item, pkField) {
       break;
     }
   }
-  
+
   if (!found) {
     sheet.appendRow(rowData);
   }
@@ -858,6 +1004,45 @@ function deleteItemFromSheet_(sheetName, id, pkField) {
       break;
     }
   }
+}
+
+/**
+ * Generate sequential IDs server-side to prevent collisions.
+ * Format: PREFIX-YYYYMMDD-NNNN (NNNN = 4-digit sequence per day)
+ */
+function generateId_(prefix) {
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(15000);
+  } catch (e) {
+    throw new Error('Server sibuk (generateId lock). Coba lagi.');
+  }
+
+  try {
+    const today = new Date();
+    const yyyy = today.getFullYear();
+    const mm = String(today.getMonth() + 1).padStart(2, '0');
+    const dd = String(today.getDate()).padStart(2, '0');
+    const dateStr = `${yyyy}${mm}${dd}`;
+    const key = `ID_SEQ_${prefix}_${dateStr}`;
+
+    const props = PropertiesService.getScriptProperties();
+    let seq = parseInt(props.getProperty(key) || '0', 10);
+    seq++;
+    const seqStr = String(seq).padStart(4, '0');
+    props.setProperty(key, String(seq));
+
+    return `${prefix}-${dateStr}-${seqStr}`;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Generate ID for Cash Ledger (8-digit sequence)
+ */
+function generateCashId_() {
+  return generateId_('CSH').replace('CSH-', 'CSH-').replace(/-(\d{4})$/, '-$1'); // Keep 4-digit for now, can extend to 8 if needed
 }
 
 /**
@@ -959,6 +1144,95 @@ function saveCustomer(token, customer) {
   try { saveItemToSheet_('Customers', customer, 'id'); return true; } catch(e) { throw new Error(e.message); }
 }
 
+/**
+ * Create new customer with server-generated sequential ID.
+ * Fails if ID already exists (insert-only).
+ */
+function createCustomer(token, customer) {
+  requireRole_(token, ['Admin', 'Superadmin']);
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(15000);
+  } catch (e) {
+    throw new Error('Server sibuk (createCustomer lock). Coba lagi.');
+  }
+
+  try {
+    const id = generateId_('CUST');
+    const newCustomer = { ...customer, id };
+    const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Customers');
+    if (!sheet) throw new Error("Sheet 'Customers' tidak ditemukan.");
+
+    const values = sheet.getDataRange().getValues();
+    if (values.length === 0) throw new Error("Sheet 'Customers' kosong, belum ada header.");
+
+    const headers = values[0];
+    const pkIndex = headers.indexOf('id');
+
+    // Check if ID already exists (should not happen with sequential, but safety check)
+    for (let i = 1; i < values.length; i++) {
+      if (values[i][pkIndex] == id) {
+        throw new Error('ID collision: ' + id);
+      }
+    }
+
+    const writeItem = parseNumbers_(newCustomer);
+    const rowData = headers.map(h => writeItem[h] === undefined ? "" : writeItem[h]);
+    sheet.appendRow(rowData);
+
+    return { success: true, id };
+  } catch (e) {
+    throw new Error(e.message);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Update existing customer (update-only, fails if not found).
+ */
+function updateCustomer(token, customer) {
+  requireRole_(token, ['Admin', 'Superadmin']);
+  if (!customer.id) throw new Error('Customer ID required for update.');
+
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(15000);
+  } catch (e) {
+    throw new Error('Server sibuk (updateCustomer lock). Coba lagi.');
+  }
+
+  try {
+    const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Customers');
+    if (!sheet) throw new Error("Sheet 'Customers' tidak ditemukan.");
+
+    const values = sheet.getDataRange().getValues();
+    if (values.length === 0) throw new Error("Sheet 'Customers' kosong, belum ada header.");
+
+    const headers = values[0];
+    const pkIndex = headers.indexOf('id');
+    const writeItem = parseNumbers_(customer);
+    const rowData = headers.map(h => writeItem[h] === undefined ? "" : writeItem[h]);
+
+    let found = false;
+    for (let i = 1; i < values.length; i++) {
+      if (values[i][pkIndex] == customer.id) {
+        sheet.getRange(i + 1, 1, 1, headers.length).setValues([rowData]);
+        found = true;
+        break;
+      }
+    }
+
+    if (!found) throw new Error('Customer not found: ' + customer.id);
+
+    return { success: true };
+  } catch (e) {
+    throw new Error(e.message);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
 function deleteCustomer(token, id) {
   requireRole_(token, ['Admin', 'Superadmin']);
   try { deleteItemFromSheet_('Customers', id, 'id'); return true; } catch(e) { throw new Error(e.message); }
@@ -980,6 +1254,94 @@ function getSuppliers(token) {
 function saveSupplier(token, supplier) {
   requireRole_(token, ['Admin', 'Superadmin']);
   try { saveItemToSheet_('Suppliers', supplier, 'id'); return true; } catch(e) { throw new Error(e.message); }
+}
+
+/**
+ * Create new supplier with server-generated sequential ID.
+ * Fails if ID already exists (insert-only).
+ */
+function createSupplier(token, supplier) {
+  requireRole_(token, ['Admin', 'Superadmin']);
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(15000);
+  } catch (e) {
+    throw new Error('Server sibuk (createSupplier lock). Coba lagi.');
+  }
+
+  try {
+    const id = generateId_('SUP');
+    const newSupplier = { ...supplier, id };
+    const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Suppliers');
+    if (!sheet) throw new Error("Sheet 'Suppliers' tidak ditemukan.");
+
+    const values = sheet.getDataRange().getValues();
+    if (values.length === 0) throw new Error("Sheet 'Suppliers' kosong, belum ada header.");
+
+    const headers = values[0];
+    const pkIndex = headers.indexOf('id');
+
+    for (let i = 1; i < values.length; i++) {
+      if (values[i][pkIndex] == id) {
+        throw new Error('ID collision: ' + id);
+      }
+    }
+
+    const writeItem = parseNumbers_(newSupplier);
+    const rowData = headers.map(h => writeItem[h] === undefined ? "" : writeItem[h]);
+    sheet.appendRow(rowData);
+
+    return { success: true, id };
+  } catch (e) {
+    throw new Error(e.message);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Update existing supplier (update-only, fails if not found).
+ */
+function updateSupplier(token, supplier) {
+  requireRole_(token, ['Admin', 'Superadmin']);
+  if (!supplier.id) throw new Error('Supplier ID required for update.');
+
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(15000);
+  } catch (e) {
+    throw new Error('Server sibuk (updateSupplier lock). Coba lagi.');
+  }
+
+  try {
+    const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Suppliers');
+    if (!sheet) throw new Error("Sheet 'Suppliers' tidak ditemukan.");
+
+    const values = sheet.getDataRange().getValues();
+    if (values.length === 0) throw new Error("Sheet 'Suppliers' kosong, belum ada header.");
+
+    const headers = values[0];
+    const pkIndex = headers.indexOf('id');
+    const writeItem = parseNumbers_(supplier);
+    const rowData = headers.map(h => writeItem[h] === undefined ? "" : writeItem[h]);
+
+    let found = false;
+    for (let i = 1; i < values.length; i++) {
+      if (values[i][pkIndex] == supplier.id) {
+        sheet.getRange(i + 1, 1, 1, headers.length).setValues([rowData]);
+        found = true;
+        break;
+      }
+    }
+
+    if (!found) throw new Error('Supplier not found: ' + supplier.id);
+
+    return { success: true };
+  } catch (e) {
+    throw new Error(e.message);
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 function deleteSupplier(token, id) {
@@ -1088,6 +1450,114 @@ function savePurchaseOrder(token, order) {
     }
     return true;
   } catch(e) {
+    throw new Error(e.message);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Create new purchase order with server-generated sequential ID.
+ * Fails if ID already exists (insert-only).
+ */
+function createPurchaseOrder(token, order) {
+  requireRole_(token, ['Admin', 'Superadmin']);
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(15000);
+  } catch (e) {
+    throw new Error('Server sibuk (createPurchaseOrder lock). Coba lagi.');
+  }
+
+  try {
+    const id = generateId_('PO');
+    const newOrder = { ...order, id };
+    const header = { ...newOrder };
+    delete header.items;
+
+    // Save Header
+    saveItemToSheet_('PurchaseOrders', header, 'id');
+
+    // Save Items
+    if (newOrder.items && newOrder.items.length > 0) {
+      const itemsSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('PurchaseOrderItems');
+      if (!itemsSheet) throw new Error("Sheet 'PurchaseOrderItems' tidak ditemukan.");
+
+      const currentValues = itemsSheet.getDataRange().getValues();
+      let headers = currentValues.length > 0 ? currentValues[0] : null;
+      if (!headers) throw new Error("Header di 'PurchaseOrderItems' hilang.");
+
+      const rowsToAppend = newOrder.items.map(item => {
+        const itemObj = { ...item, noPO: id };
+        const writeItem = parseNumbers_(itemObj);
+        return headers.map(h => writeItem[h] === undefined ? "" : writeItem[h]);
+      });
+
+      itemsSheet.getRange(itemsSheet.getLastRow() + 1, 1, rowsToAppend.length, headers.length).setValues(rowsToAppend);
+    }
+
+    return { success: true, id };
+  } catch (e) {
+    throw new Error(e.message);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Update existing purchase order (update-only, fails if not found).
+ */
+function updatePurchaseOrder(token, order) {
+  requireRole_(token, ['Admin', 'Superadmin']);
+  if (!order.id) throw new Error('Purchase Order ID required for update.');
+
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(15000);
+  } catch (e) {
+    throw new Error('Server sibuk (updatePurchaseOrder lock). Coba lagi.');
+  }
+
+  try {
+    // Check if exists
+    const existing = getSheetData_('PurchaseOrders').find(o => o.id == order.id);
+    if (!existing) throw new Error('Purchase Order not found: ' + order.id);
+
+    const header = { ...order };
+    delete header.items;
+    saveItemToSheet_('PurchaseOrders', header, 'id');
+
+    // Update Items: delete old, insert new
+    const itemsSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('PurchaseOrderItems');
+    if (!itemsSheet) throw new Error("Sheet 'PurchaseOrderItems' tidak ditemukan.");
+
+    const values = itemsSheet.getDataRange().getValues();
+    if (values.length > 1) {
+      const headers = values[0];
+      const noPOIndex = headers.indexOf('noPO');
+      for (let i = values.length - 1; i >= 1; i--) {
+        if (values[i][noPOIndex] == order.id) {
+          itemsSheet.deleteRow(i + 1);
+        }
+      }
+    }
+
+    if (order.items && order.items.length > 0) {
+      const currentValues = itemsSheet.getDataRange().getValues();
+      let headers = currentValues.length > 0 ? currentValues[0] : null;
+      if (!headers) throw new Error("Header di 'PurchaseOrderItems' hilang.");
+
+      const rowsToAppend = order.items.map(item => {
+        const itemObj = { ...item, noPO: order.id };
+        const writeItem = parseNumbers_(itemObj);
+        return headers.map(h => writeItem[h] === undefined ? "" : writeItem[h]);
+      });
+
+      itemsSheet.getRange(itemsSheet.getLastRow() + 1, 1, rowsToAppend.length, headers.length).setValues(rowsToAppend);
+    }
+
+    return { success: true };
+  } catch (e) {
     throw new Error(e.message);
   } finally {
     lock.releaseLock();
@@ -1265,6 +1735,114 @@ function saveSalesOrder(token, order) {
   }
 }
 
+/**
+ * Create new sales order with server-generated sequential ID.
+ * Fails if ID already exists (insert-only).
+ */
+function createSalesOrder(token, order) {
+  requireRole_(token, ['Admin', 'Superadmin']);
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(15000);
+  } catch (e) {
+    throw new Error('Server sibuk (createSalesOrder lock). Coba lagi.');
+  }
+
+  try {
+    const id = generateId_('SO');
+    const newOrder = { ...order, id };
+    const header = { ...newOrder };
+    delete header.items;
+
+    // Save Header
+    saveItemToSheet_('SalesOrders', header, 'id');
+
+    // Save Items
+    if (newOrder.items && newOrder.items.length > 0) {
+      const itemsSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('SalesOrderItems');
+      if (!itemsSheet) throw new Error("Sheet 'SalesOrderItems' tidak ditemukan.");
+
+      const currentValues = itemsSheet.getDataRange().getValues();
+      let headers = currentValues.length > 0 ? currentValues[0] : null;
+      if (!headers) throw new Error("Header di 'SalesOrderItems' hilang.");
+
+      const rowsToAppend = newOrder.items.map(item => {
+        const itemObj = { ...item, noSO: id };
+        const writeItem = parseNumbers_(itemObj);
+        return headers.map(h => writeItem[h] === undefined ? "" : writeItem[h]);
+      });
+
+      itemsSheet.getRange(itemsSheet.getLastRow() + 1, 1, rowsToAppend.length, headers.length).setValues(rowsToAppend);
+    }
+
+    return { success: true, id };
+  } catch (e) {
+    throw new Error(e.message);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Update existing sales order (update-only, fails if not found).
+ */
+function updateSalesOrder(token, order) {
+  requireRole_(token, ['Admin', 'Superadmin']);
+  if (!order.id) throw new Error('Sales Order ID required for update.');
+
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(15000);
+  } catch (e) {
+    throw new Error('Server sibuk (updateSalesOrder lock). Coba lagi.');
+  }
+
+  try {
+    // Check if exists
+    const existing = getSheetData_('SalesOrders').find(o => o.id == order.id);
+    if (!existing) throw new Error('Sales Order not found: ' + order.id);
+
+    const header = { ...order };
+    delete header.items;
+    saveItemToSheet_('SalesOrders', header, 'id');
+
+    // Update Items: delete old, insert new
+    const itemsSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('SalesOrderItems');
+    if (!itemsSheet) throw new Error("Sheet 'SalesOrderItems' tidak ditemukan.");
+
+    const values = itemsSheet.getDataRange().getValues();
+    if (values.length > 1) {
+      const headers = values[0];
+      const noSOIndex = headers.indexOf('noSO');
+      for (let i = values.length - 1; i >= 1; i--) {
+        if (values[i][noSOIndex] == order.id) {
+          itemsSheet.deleteRow(i + 1);
+        }
+      }
+    }
+
+    if (order.items && order.items.length > 0) {
+      const currentValues = itemsSheet.getDataRange().getValues();
+      let headers = currentValues.length > 0 ? currentValues[0] : null;
+      if (!headers) throw new Error("Header di 'SalesOrderItems' hilang.");
+
+      const rowsToAppend = order.items.map(item => {
+        const itemObj = { ...item, noSO: order.id };
+        const writeItem = parseNumbers_(itemObj);
+        return headers.map(h => writeItem[h] === undefined ? "" : writeItem[h]);
+      });
+
+      itemsSheet.getRange(itemsSheet.getLastRow() + 1, 1, rowsToAppend.length, headers.length).setValues(rowsToAppend);
+    }
+
+    return { success: true };
+  } catch (e) {
+    throw new Error(e.message);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
 function deleteSalesOrder(token, id) {
   requireRole_(token, ['Admin', 'Superadmin']);
   try {
@@ -1335,6 +1913,94 @@ function getCashLedger(token) {
 function saveCashEntry(token, entry) {
   requireRole_(token, ['Admin', 'Superadmin']);
   try { saveItemToSheet_('CashLedger', entry, 'id'); return true; } catch(e) { throw new Error(e.message); }
+}
+
+/**
+ * Create new cash entry with server-generated sequential ID.
+ * Fails if ID already exists (insert-only).
+ */
+function createCashEntry(token, entry) {
+  requireRole_(token, ['Admin', 'Superadmin']);
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(15000);
+  } catch (e) {
+    throw new Error('Server sibuk (createCashEntry lock). Coba lagi.');
+  }
+
+  try {
+    const id = generateId_('CSH');
+    const newEntry = { ...entry, id };
+    const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('CashLedger');
+    if (!sheet) throw new Error("Sheet 'CashLedger' tidak ditemukan.");
+
+    const values = sheet.getDataRange().getValues();
+    if (values.length === 0) throw new Error("Sheet 'CashLedger' kosong, belum ada header.");
+
+    const headers = values[0];
+    const pkIndex = headers.indexOf('id');
+
+    for (let i = 1; i < values.length; i++) {
+      if (values[i][pkIndex] == id) {
+        throw new Error('ID collision: ' + id);
+      }
+    }
+
+    const writeItem = parseNumbers_(newEntry);
+    const rowData = headers.map(h => writeItem[h] === undefined ? "" : writeItem[h]);
+    sheet.appendRow(rowData);
+
+    return { success: true, id };
+  } catch (e) {
+    throw new Error(e.message);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Update existing cash entry (update-only, fails if not found).
+ */
+function updateCashEntry(token, entry) {
+  requireRole_(token, ['Admin', 'Superadmin']);
+  if (!entry.id) throw new Error('Cash Entry ID required for update.');
+
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(15000);
+  } catch (e) {
+    throw new Error('Server sibuk (updateCashEntry lock). Coba lagi.');
+  }
+
+  try {
+    const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('CashLedger');
+    if (!sheet) throw new Error("Sheet 'CashLedger' tidak ditemukan.");
+
+    const values = sheet.getDataRange().getValues();
+    if (values.length === 0) throw new Error("Sheet 'CashLedger' kosong, belum ada header.");
+
+    const headers = values[0];
+    const pkIndex = headers.indexOf('id');
+    const writeItem = parseNumbers_(entry);
+    const rowData = headers.map(h => writeItem[h] === undefined ? "" : writeItem[h]);
+
+    let found = false;
+    for (let i = 1; i < values.length; i++) {
+      if (values[i][pkIndex] == entry.id) {
+        sheet.getRange(i + 1, 1, 1, headers.length).setValues([rowData]);
+        found = true;
+        break;
+      }
+    }
+
+    if (!found) throw new Error('Cash Entry not found: ' + entry.id);
+
+    return { success: true };
+  } catch (e) {
+    throw new Error(e.message);
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 function deleteCashEntry(token, id) {
@@ -1654,7 +2320,7 @@ function simpanTransaksiPenjualan(payload) {
     const statusBayar = isPiutang ? 'Belum Lunas' : 'Lunas';
     const totalPaid = isPiutang ? 0 : serverGrandTotal;
 
-    // 3. Tulis Header ke SalesOrders
+    // 3. Tulis Header ke SalesOrders (D5: items di SalesOrderItems, bukan JSON di header)
     const soSheet = ss.getSheetByName(SHEET_SALES_ORDERS);
     const soRow = {
       id: strukNo,
@@ -1662,9 +2328,7 @@ function simpanTransaksiPenjualan(payload) {
       customerId: payload.customerId || '',
       pelanggan: payload.customerNama || 'Pelanggan Umum Retail',
       metode: metode,
-      items: JSON.stringify(verifiedItems.map(it => ({
-        sku: it.sku, nama: it.nama, satuan: it.satuan, qty: it.qty, harga: it.hargaJual, subtotal: it.subtotal
-      }))),
+      // items: DISI SIMPAN DI SalesOrderItems (relasional), bukan JSON di header
       subtotal: serverGrandTotal,
       diskon: 0,
       pajak: 0,
@@ -1758,6 +2422,550 @@ function simpanTransaksiPenjualan(payload) {
   } finally {
     lock.releaseLock();
   }
+}
+
+// ==========================================
+// D6: VOID LOG & RETUR SERVER FUNCTIONS
+// ==========================================
+
+/**
+ * Create Void Log entry (D6)
+ * Mencatat pembatalan dokumen untuk audit trail
+ */
+function createVoidLog(token, voidLogData) {
+  requireRole_(token, ['Admin', 'Superadmin', 'Kasir']);
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(15000);
+  } catch (e) {
+    throw new Error('Server sibuk (createVoidLog lock). Coba lagi.');
+  }
+
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName('VoidLog');
+    if (!sheet) throw new Error("Sheet 'VoidLog' tidak ditemukan.");
+
+    const values = sheet.getDataRange().getValues();
+    if (values.length === 0) throw new Error("Sheet 'VoidLog' kosong, belum ada header.");
+
+    const headers = values[0];
+    const today = formatDate_(new Date());
+    const voidId = `VOID-${today.replace(/-/g, '')}-${generateIdSuffix_(sheet, 'VOID', today)}`;
+
+    const newLog = {
+      id: voidId,
+      tanggal: voidLogData.tanggal || today,
+      docType: voidLogData.docType,
+      docId: voidLogData.docId,
+      kasir: voidLogData.kasir,
+      nilai: Number(voidLogData.nilai) || 0,
+      alasan: voidLogData.alasan || '',
+      timestamp: new Date().toISOString()
+    };
+
+    const writeItem = parseNumbers_(newLog);
+    const rowData = headers.map(h => writeItem[h] === undefined ? "" : writeItem[h]);
+    sheet.appendRow(rowData);
+
+    return { success: true, id: voidId };
+  } catch (e) {
+    throw new Error(e.message);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Generate ID suffix for VoidLog
+ */
+function generateIdSuffix_(sheet, prefix, dateStr) {
+  const data = sheet.getDataRange().getValues();
+  const header = data[0];
+  const idCol = header.indexOf('id');
+  if (idCol === -1) return '001';
+
+  let maxNum = 0;
+  const searchPrefix = `${prefix}-${dateStr}-`;
+  for (let i = 1; i < data.length; i++) {
+    const id = String(data[i][idCol] || '');
+    if (id.indexOf(searchPrefix) === 0) {
+      const num = parseInt(id.split('-')[2], 10);
+      if (!isNaN(num) && num > maxNum) maxNum = num;
+    }
+  }
+  return String(maxNum + 1).padStart(3, '0');
+}
+
+/**
+ * Process Retur (D6)
+ * Menangani retur barang untuk SO/PO yang sudah lunas
+ * - Kembalikan stok (SO: +, PO: -)
+ * - Koreksi piutang/hutang
+ * - Catat kas (refund tunai)
+ * - Update qtyReturned di SalesOrderItems/PurchaseOrderItems
+ * - Update statusLogistik ke 'Retur Penuh'/'Retur Sebagian'
+ */
+function processRetur(token, returData) {
+  requireRole_(token, ['Admin', 'Superadmin']);
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(15000);
+  } catch (e) {
+    throw new Error('Server sibuk (processRetur lock). Coba lagi.');
+  }
+
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const { docType, docId, returnItems, alasan } = returData;
+
+    if (!docType || !docId || !returnItems || returnItems.length === 0) {
+      throw new Error('Parameter tidak lengkap: docType, docId, returnItems diperlukan');
+    }
+
+    const isSO = docType === 'SO';
+    const headerSheetName = isSO ? 'SalesOrders' : 'PurchaseOrders';
+    const itemsSheetName = isSO ? 'SalesOrderItems' : 'PurchaseOrderItems';
+    const idField = isSO ? 'id' : 'id';
+    const itemsRefField = isSO ? 'noSO' : 'noPO';
+
+    const headerSheet = ss.getSheetByName(headerSheetName);
+    const itemsSheet = ss.getSheetByName(itemsSheetName);
+    if (!headerSheet || !itemsSheet) throw new Error('Sheet tidak ditemukan');
+
+    // 1. Baca header dokumen
+    const headerValues = headerSheet.getDataRange().getValues();
+    const headerHeaders = headerValues[0];
+    const idCol = headerHeaders.indexOf(idField);
+    let headerRow = -1;
+    let headerData = null;
+
+    for (let i = 1; i < headerValues.length; i++) {
+      if (String(headerValues[i][idCol]) === docId) {
+        headerRow = i + 1;
+        headerData = {};
+        headerHeaders.forEach((h, idx) => { headerData[h] = headerValues[i][idx]; });
+        break;
+      }
+    }
+
+    if (!headerData) throw new Error(`Dokumen ${docType} ${docId} tidak ditemukan`);
+
+    // Validasi status
+    const statusLogistik = headerData.statusLogistik;
+    const statusBayar = headerData.statusBayar;
+    if (statusLogistik === 'Void' || statusBayar === 'Void') {
+      throw new Error('Dokumen sudah di-void, tidak bisa di-retur');
+    }
+    if ((isSO && statusLogistik !== 'Selesai') || (!isSO && statusLogistik !== 'Diterima')) {
+      throw new Error('Hanya dokumen Selesai (SO) / Diterima (PO) yang bisa di-retur');
+    }
+    if (statusBayar !== 'Lunas') {
+      throw new Error('Hanya dokumen Lunas yang bisa di-retur');
+    }
+
+    // 2. Baca items dokumen
+    const itemsValues = itemsSheet.getDataRange().getValues();
+    const itemsHeaders = itemsValues[0];
+    const refCol = itemsHeaders.indexOf(itemsRefField);
+    const skuCol = itemsHeaders.indexOf('sku');
+    const qtyCol = itemsHeaders.indexOf('qty');
+    const qtyShippedCol = itemsHeaders.indexOf('qtyShipped');
+    const qtyReceivedCol = itemsHeaders.indexOf('qtyReceived');
+    const qtyReturnedCol = itemsHeaders.indexOf('qtyReturned');
+    const hargaCol = itemsHeaders.indexOf('harga');
+    const hppCol = itemsHeaders.indexOf('hpp');
+
+    const existingItems = [];
+    for (let i = 1; i < itemsValues.length; i++) {
+      if (String(itemsValues[i][refCol]) === docId) {
+        existingItems.push({
+          rowNum: i + 1,
+          sku: String(itemsValues[i][skuCol]),
+          nama: String(itemsValues[i][itemsHeaders.indexOf('nama')] || ''),
+          qty: Number(itemsValues[i][qtyCol]) || 0,
+          qtyShipped: Number(itemsValues[i][qtyShippedCol]) || 0,
+          qtyReceived: Number(itemsValues[i][qtyReceivedCol]) || 0,
+          qtyReturned: Number(itemsValues[i][qtyReturnedCol]) || 0,
+          harga: Number(itemsValues[i][hargaCol]) || 0,
+          hpp: Number(itemsValues[i][hppCol]) || 0
+        });
+      }
+    }
+
+    // 3. Validasi return items
+    const returnMap = new Map(returnItems.map(r => [r.sku, Number(r.qty)]));
+    let totalRefund = 0;
+    const stockAdjustments = [];
+
+    for (const item of existingItems) {
+      const returnQty = returnMap.get(item.sku) || 0;
+      if (returnQty > 0) {
+        const qtyDelivered = isSO ? (item.qtyShipped || item.qty) : (item.qtyReceived || item.qty);
+        const availableForReturn = qtyDelivered - (item.qtyReturned || 0);
+        if (returnQty > availableForReturn) {
+          throw new Error(`Qty retur melebihi batas untuk ${item.sku} (max: ${availableForReturn})`);
+        }
+
+        totalRefund += returnQty * item.harga;
+        stockAdjustments.push({
+          sku: item.sku,
+          qty: isSO ? returnQty : -returnQty,
+          rowNum: item.rowNum
+        });
+      }
+    }
+
+    if (totalRefund === 0) throw new Error('Tidak ada item valid untuk di-retur');
+
+    // 4. Update qtyReturned di items sheet
+    for (const item of existingItems) {
+      const returnQty = returnMap.get(item.sku) || 0;
+      if (returnQty > 0) {
+        const newQtyReturned = (item.qtyReturned || 0) + returnQty;
+        itemsSheet.getRange(item.rowNum, qtyReturnedCol + 1).setValue(newQtyReturned);
+      }
+    }
+
+    // 5. Update statusLogistik
+    let newStatusLogistik = statusLogistik;
+    let totalDelivered = 0;
+    let totalReturned = 0;
+    for (const item of existingItems) {
+      const qtyDelivered = isSO ? (item.qtyShipped || item.qty) : (item.qtyReceived || item.qty);
+      const returned = (item.qtyReturned || 0) + (returnMap.get(item.sku) || 0);
+      totalDelivered += qtyDelivered;
+      totalReturned += returned;
+    }
+    if (totalReturned >= totalDelivered) {
+      newStatusLogistik = 'Retur Penuh';
+    } else if (totalReturned > 0) {
+      newStatusLogistik = 'Retur Sebagian';
+    }
+
+    if (newStatusLogistik !== statusLogistik) {
+      const statusLogistikCol = headerHeaders.indexOf('statusLogistik');
+      headerSheet.getRange(headerRow, statusLogistikCol + 1).setValue(newStatusLogistik);
+    }
+
+    // 6. Koreksi Stok
+    for (const adj of stockAdjustments) {
+      const prodSheet = ss.getSheetByName('Products');
+      if (prodSheet) {
+        const prodData = prodSheet.getDataRange().getValues();
+        const prodHeaders = prodData[0];
+        const prodSkuCol = prodHeaders.indexOf('sku');
+        const prodStokCol = prodHeaders.indexOf('stok');
+        for (let i = 1; i < prodData.length; i++) {
+          if (String(prodData[i][prodSkuCol]) === adj.sku) {
+            const currentStok = Number(prodData[i][prodStokCol]) || 0;
+            prodSheet.getRange(i + 1, prodStokCol + 1).setValue(currentStok + adj.qty);
+            break;
+          }
+        }
+      }
+    }
+
+    // 7. Koreksi Piutang/Hutang
+    const customerId = headerData.customerId;
+    const supplierId = headerData.supplierId;
+    const metode = headerData.metode;
+    const pelanggan = headerData.pelanggan;
+
+    if (isSO && customerId) {
+      adjustBalanceServer_('customer', customerId, -totalRefund);
+    } else if (!isSO && supplierId) {
+      adjustBalanceServer_('supplier', supplierId, -totalRefund);
+    }
+
+    // 8. Catat Kas (refund tunai)
+    const isCash = String(metode).toLowerCase().includes('tunai') || String(metode).toLowerCase().includes('cash');
+    if (isCash && totalRefund > 0) {
+      const cashSheet = ss.getSheetByName('CashLedger');
+      if (cashSheet) {
+        const cashData = cashSheet.getDataRange().getValues();
+        const cashHeaders = cashData[0];
+        const akun = 'Kas Tunai';
+        const lastSaldo = getLastSaldoForAkun_(cashSheet, akun);
+
+        const cashEntry = {
+          id: generateId_('CSH', cashSheet),
+          tanggal: formatDate_(new Date()),
+          ref: `RETUR-${docId}`,
+          keterangan: isSO ? `Retur Penjualan [${docId}] dari ${pelanggan}` : `Retur Pembelian [${docId}] ke Supplier`,
+          kategori: 'Retur',
+          debit: isSO ? 0 : totalRefund,
+          kredit: isSO ? totalRefund : 0,
+          saldo: isSO ? lastSaldo - totalRefund : lastSaldo + totalRefund,
+          akun: akun,
+          metode: 'Tunai'
+        };
+        appendRowFromObject_(cashSheet, cashEntry);
+      }
+    }
+
+    // 9. Catat VoidLog untuk retur
+    const voidLogSheet = ss.getSheetByName('VoidLog');
+    if (voidLogSheet) {
+      const voidLog = {
+        id: `VOID-${formatDate_(new Date()).replace(/-/g, '')}-${generateIdSuffix_(voidLogSheet, 'VOID', formatDate_(new Date()).replace(/-/g, ''))}`,
+        tanggal: formatDate_(new Date()),
+        docType: docType,
+        docId: docId,
+        kasir: 'Retur Operator',
+        nilai: totalRefund,
+        alasan: alasan || 'Retur barang',
+        timestamp: new Date().toISOString()
+      };
+      const voidLogHeaders = voidLogSheet.getDataRange().getValues()[0];
+      const voidLogRow = voidLogHeaders.map(h => voidLog[h] === undefined ? "" : voidLog[h]);
+      voidLogSheet.appendRow(voidLogRow);
+    }
+
+    return { success: true, totalRefund, newStatusLogistik };
+  } catch (e) {
+    throw new Error(e.message);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Helper: Adjust balance on server side (for retur/void)
+ */
+function adjustBalanceServer_(partyType, partyId, amount) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheetName = partyType === 'customer' ? 'Customers' : 'Suppliers';
+  const sheet = ss.getSheetByName(sheetName);
+  if (!sheet) return;
+
+  const data = sheet.getDataRange().getValues();
+  const headers = data[0];
+  const idCol = headers.indexOf('id');
+  const balanceCol = headers.indexOf(partyType === 'customer' ? 'piutang' : 'hutang');
+
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][idCol]) === partyId) {
+      const currentBalance = Number(data[i][balanceCol]) || 0;
+      sheet.getRange(i + 1, balanceCol + 1).setValue(currentBalance + amount);
+      break;
+    }
+  }
+}
+
+/**
+ * Get last saldo for akun in CashLedger
+ */
+function getLastSaldoForAkun_(sheet, akun) {
+  const data = sheet.getDataRange().getValues();
+  const headers = data[0];
+  const akunCol = headers.indexOf('akun');
+  const saldoCol = headers.indexOf('saldo');
+  if (akunCol === -1 || saldoCol === -1) return 0;
+
+  for (let i = data.length - 1; i >= 1; i--) {
+    if (String(data[i][akunCol]) === akun) {
+      return Number(data[i][saldoCol]) || 0;
+    }
+  }
+  return 0;
+}
+
+/**
+ * D6 — Void Document
+ * Membatalkan dokumen (SO/PO):
+ * - Balik stok (SO: +qtyShipped, PO: -qtyReceived)
+ * - Koreksi piutang/hutang (jika belum lunas)
+ * - Catat kas (jika tunai & lunas)
+ * - Update status ke 'Void'
+ * - Catat VoidLog
+ */
+function voidDocument(token, docType, docId, alasan) {
+  requireRole_(token, ['Admin', 'Superadmin']);
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(15000);
+  } catch (e) {
+    throw new Error('Server sibuk (voidDocument lock). Coba lagi.');
+  }
+
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const isSO = docType === 'SO';
+    const headerSheetName = isSO ? 'SalesOrders' : 'PurchaseOrders';
+    const itemsSheetName = isSO ? 'SalesOrderItems' : 'PurchaseOrderItems';
+    const idField = isSO ? 'id' : 'id';
+    const itemsRefField = isSO ? 'noSO' : 'noPO';
+
+    const headerSheet = ss.getSheetByName(headerSheetName);
+    const itemsSheet = ss.getSheetByName(itemsSheetName);
+    if (!headerSheet || !itemsSheet) throw new Error('Sheet tidak ditemukan');
+
+    // 1. Baca header dokumen
+    const headerValues = headerSheet.getDataRange().getValues();
+    const headerHeaders = headerValues[0];
+    const idCol = headerHeaders.indexOf(idField);
+    let headerRow = -1;
+    let headerData = null;
+
+    for (let i = 1; i < headerValues.length; i++) {
+      if (String(headerValues[i][idCol]) === docId) {
+        headerRow = i + 1;
+        headerData = {};
+        headerHeaders.forEach((h, idx) => { headerData[h] = headerValues[i][idx]; });
+        break;
+      }
+    }
+
+    if (!headerData) throw new Error(`Dokumen ${docType} ${docId} tidak ditemukan`);
+
+    // Validasi status
+    const statusLogistik = headerData.statusLogistik;
+    const statusBayar = headerData.statusBayar;
+    if (statusLogistik === 'Void' || statusBayar === 'Void') {
+      throw new Error('Dokumen sudah di-void');
+    }
+
+    // 2. Baca items dokumen
+    const itemsValues = itemsSheet.getDataRange().getValues();
+    const itemsHeaders = itemsValues[0];
+    const refCol = itemsHeaders.indexOf(itemsRefField);
+    const skuCol = itemsHeaders.indexOf('sku');
+    const qtyCol = itemsHeaders.indexOf('qty');
+    const qtyShippedCol = itemsHeaders.indexOf('qtyShipped');
+    const qtyReceivedCol = itemsHeaders.indexOf('qtyReceived');
+
+    const existingItems = [];
+    for (let i = 1; i < itemsValues.length; i++) {
+      if (String(itemsValues[i][refCol]) === docId) {
+        existingItems.push({
+          sku: String(itemsValues[i][skuCol]),
+          qty: Number(itemsValues[i][qtyCol]) || 0,
+          qtyShipped: Number(itemsValues[i][qtyShippedCol]) || 0,
+          qtyReceived: Number(itemsValues[i][qtyReceivedCol]) || 0
+        });
+      }
+    }
+
+    // 3. Koreksi Stok
+    for (const item of existingItems) {
+      const prodSheet = ss.getSheetByName('Products');
+      if (prodSheet) {
+        const prodData = prodSheet.getDataRange().getValues();
+        const prodHeaders = prodData[0];
+        const prodSkuCol = prodHeaders.indexOf('sku');
+        const prodStokCol = prodHeaders.indexOf('stok');
+        for (let j = 1; j < prodData.length; j++) {
+          if (String(prodData[j][prodSkuCol]) === item.sku) {
+            const currentStok = Number(prodData[j][prodStokCol]) || 0;
+            let delta = 0;
+            if (isSO) {
+              // SO void: kembalikan stok yang sudah dikirim
+              delta = item.qtyShipped || item.qty;
+            } else {
+              // PO void: kurangi stok yang sudah diterima
+              delta = -(item.qtyReceived || item.qty);
+            }
+            prodSheet.getRange(j + 1, prodStokCol + 1).setValue(currentStok + delta);
+            break;
+          }
+        }
+      }
+    }
+
+    // 4. Koreksi Piutang/Hutang (hanya jika belum lunas)
+    const customerId = headerData.customerId;
+    const supplierId = headerData.supplierId;
+    const grandTotal = Number(headerData.grandTotal) || 0;
+
+    if (isSO && customerId && statusBayar === 'Belum Lunas') {
+      adjustBalanceServer_('customer', customerId, -grandTotal);
+    } else if (!isSO && supplierId && statusBayar === 'Belum Dibayar') {
+      adjustBalanceServer_('supplier', supplierId, -grandTotal);
+    }
+
+    // 5. Catat Kas (jika tunai & lunas)
+    const metode = headerData.metode;
+    const pelanggan = headerData.pelanggan;
+    const isCash = String(metode).toLowerCase().includes('tunai') || String(metode).toLowerCase().includes('cash');
+    if (isCash && statusBayar === 'Lunas') {
+      const cashSheet = ss.getSheetByName('CashLedger');
+      if (cashSheet) {
+        const cashData = cashSheet.getDataRange().getValues();
+        const cashHeaders = cashData[0];
+        const akun = 'Kas Tunai';
+        const lastSaldo = getLastSaldoForAkun_(cashSheet, akun);
+
+        const cashEntry = {
+          id: generateId_('CSH', cashSheet),
+          tanggal: formatDate_(new Date()),
+          ref: `VOID-${docId}`,
+          keterangan: isSO ? `Void Penjualan Tunai [${docId}] dari ${pelanggan}` : `Void Pembelian Tunai [${docId}] ke Supplier`,
+          kategori: 'Void',
+          debit: isSO ? 0 : grandTotal,
+          kredit: isSO ? grandTotal : 0,
+          saldo: isSO ? lastSaldo - grandTotal : lastSaldo + grandTotal,
+          akun: akun,
+          metode: 'Tunai'
+        };
+        appendRowFromObject_(cashSheet, cashEntry);
+      }
+    }
+
+    // 6. Update status ke Void
+    const statusLogistikCol = headerHeaders.indexOf('statusLogistik');
+    const statusBayarCol = headerHeaders.indexOf('statusBayar');
+    headerSheet.getRange(headerRow, statusLogistikCol + 1).setValue('Void');
+    headerSheet.getRange(headerRow, statusBayarCol + 1).setValue('Void');
+
+    // 7. Catat VoidLog
+    const voidLogSheet = ss.getSheetByName('VoidLog');
+    if (voidLogSheet) {
+      const today = formatDate_(new Date());
+      const voidLog = {
+        id: `VOID-${today.replace(/-/g, '')}-${generateIdSuffix_(voidLogSheet, 'VOID', today.replace(/-/g, ''))}`,
+        tanggal: today,
+        docType: docType,
+        docId: docId,
+        kasir: 'Operator',
+        nilai: grandTotal,
+        alasan: alasan || '',
+        timestamp: new Date().toISOString()
+      };
+      const voidLogHeaders = voidLogSheet.getDataRange().getValues()[0];
+      const voidLogRow = voidLogHeaders.map(h => voidLog[h] === undefined ? "" : voidLog[h]);
+      voidLogSheet.appendRow(voidLogRow);
+    }
+
+    return { success: true, voidLogId: voidLog.id };
+  } catch (e) {
+    throw new Error(e.message);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * D6 — Get Void Log
+ * Mengambil semua VoidLog untuk audit
+ */
+function getVoidLog(token) {
+  requireRole_(token, ['Admin', 'Superadmin', 'Kasir']);
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName('VoidLog');
+  if (!sheet) return [];
+
+  const data = sheet.getDataRange().getValues();
+  if (data.length <= 1) return [];
+
+  const headers = data[0];
+  const rows = data.slice(1);
+
+  return rows.map(row => {
+    const obj = {};
+    headers.forEach((h, idx) => { obj[h] = row[idx]; });
+    return obj;
+  });
 }
 
 // ==========================================
@@ -2040,4 +3248,244 @@ function getRingkasanDashboard(token) {
     jumlahStokKritis: jumlahStokKritis,
     salesLogs: salesLogs
   };
+}
+
+// ============================================================
+// DELTA OPS: LockService + Idempotency (D1)
+// ============================================================
+
+/**
+ * Cek cache idempotency. Mengembalikan hasil cache jika ada, null jika tidak.
+ * Key format: 'idempotent_' + opId
+ * TTL: 6 jam (21600 detik)
+ */
+function checkIdempotency_(opId) {
+  const cache = CacheService.getScriptCache();
+  const key = 'idempotent_' + opId;
+  const cached = cache.get(key);
+  if (cached) return JSON.parse(cached);
+  return null;
+}
+
+/**
+ * Simpan hasil operasi ke cache idempotency.
+ */
+function storeIdempotency_(opId, result) {
+  const cache = CacheService.getScriptCache();
+  const key = 'idempotent_' + opId;
+  cache.put(key, JSON.stringify(result), 21600); // 6 jam
+}
+
+/**
+ * D1 — Atomic Stock Adjustment
+ * Mengubah stok produk secara atomik dengan validasi stok tidak negatif.
+ *
+ * @param {string} sku - SKU produk
+ * @param {number} deltaQty - Perubahan stok (positif = receive, negatif = sell/consume)
+ * @param {string} opId - Idempotency key (UUID dari klien)
+ * @returns {Object} { ok: true, newStock: number, sku: string }
+ * @throws {Error} STOK_TIDAK_CUKUP jika stok hasil < 0, atau error lain
+ */
+function adjustStock(sku, deltaQty, opId) {
+  if (!sku || typeof deltaQty !== 'number' || !opId) {
+    throw new Error('Parameter tidak valid: sku, deltaQty (number), dan opId wajib diisi.');
+  }
+
+  // Cek idempotency
+  const cached = checkIdempotency_(opId);
+  if (cached) return cached;
+
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(15000);
+  } catch (e) {
+    throw new Error('Server sibuk. Coba lagi.');
+  }
+
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const prodSheet = ss.getSheetByName('Products');
+    if (!prodSheet) throw new Error("Sheet 'Products' tidak ditemukan.");
+
+    const data = prodSheet.getDataRange().getValues();
+    if (data.length <= 1) throw new Error("Sheet 'Products' kosong, belum ada header.");
+
+    const headers = data[0];
+    const skuIdx = headers.indexOf('sku');
+    const stokIdx = headers.indexOf('stok');
+    if (skuIdx === -1 || stokIdx === -1) throw new Error("Kolom 'sku' atau 'stok' tidak ditemukan di header Products.");
+
+    let targetRow = -1;
+    let currentStock = 0;
+    for (let i = 1; i < data.length; i++) {
+      if (String(data[i][skuIdx] || '').trim() === String(sku).trim()) {
+        targetRow = i + 1; // 1-based row number
+        currentStock = Number(data[i][stokIdx]) || 0;
+        break;
+      }
+    }
+
+    if (targetRow === -1) {
+      throw new Error('PRODUK_TIDAK_DITEMUKAN: Produk dengan SKU \'' + sku + '\' tidak terdaftar.');
+    }
+
+    const newStock = currentStock + deltaQty;
+    if (newStock < 0) {
+      throw new Error('STOK_TIDAK_CUKUP: Stok tidak mencukupi (sisa: ' + currentStock + ', diminta: ' + Math.abs(deltaQty) + ')');
+    }
+
+    // Tulis stok baru
+    prodSheet.getRange(targetRow, stokIdx + 1).setValue(newStock);
+
+    const result = { ok: true, newStock: newStock, sku: sku };
+    storeIdempotency_(opId, result);
+    return result;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * D1 — Atomic Balance Adjustment (Piutang/Hutang)
+ * Mengubah balance piutang (customer) atau hutang (supplier) secara atomik.
+ *
+ * @param {string} entityType - 'customer' | 'supplier'
+ * @param {string} entityId - ID customer atau supplier
+ * @param {number} delta - Perubahan balance (positif = naik, negatif = turun)
+ * @param {string} opId - Idempotency key
+ * @returns {Object} { ok: true, newBalance: number, entityId: string, entityType: string }
+ * @throws {Error} Balance tidak boleh negatif, atau entity tidak ditemukan
+ */
+function adjustBalance(entityType, entityId, delta, opId) {
+  if (!entityType || !entityId || typeof delta !== 'number' || !opId) {
+    throw new Error('Parameter tidak valid: entityType, entityId, delta (number), dan opId wajib diisi.');
+  }
+  if (entityType !== 'customer' && entityType !== 'supplier') {
+    throw new Error("entityType harus 'customer' atau 'supplier'.");
+  }
+
+  // Cek idempotency
+  const cached = checkIdempotency_(opId);
+  if (cached) return cached;
+
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(15000);
+  } catch (e) {
+    throw new Error('Server sibuk. Coba lagi.');
+  }
+
+  try {
+    const sheetName = entityType === 'customer' ? 'Customers' : 'Suppliers';
+    const balanceField = entityType === 'customer' ? 'piutang' : 'hutang';
+
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName(sheetName);
+    if (!sheet) throw new Error("Sheet '" + sheetName + "' tidak ditemukan.");
+
+    const data = sheet.getDataRange().getValues();
+    if (data.length <= 1) throw new Error("Sheet '" + sheetName + "' kosong, belum ada header.");
+
+    const headers = data[0];
+    const idIdx = headers.indexOf('id');
+    const balanceIdx = headers.indexOf(balanceField);
+    if (idIdx === -1 || balanceIdx === -1) throw new Error("Kolom 'id' atau '" + balanceField + "' tidak ditemukan di header " + sheetName + ".");
+
+    let targetRow = -1;
+    let currentBalance = 0;
+    for (let i = 1; i < data.length; i++) {
+      if (String(data[i][idIdx] || '').trim() === String(entityId).trim()) {
+        targetRow = i + 1;
+        currentBalance = Number(data[i][balanceIdx]) || 0;
+        break;
+      }
+    }
+
+    if (targetRow === -1) {
+      throw new Error(entityType.charAt(0).toUpperCase() + entityType.slice(1) + '_TIDAK_DITEMUKAN: ' + entityType + ' dengan ID \'' + entityId + '\' tidak terdaftar.');
+    }
+
+    const newBalance = currentBalance + delta;
+    if (newBalance < 0) {
+      throw new Error('BALANCE_NEGATIF: ' + balanceField + ' tidak boleh negatif (sisa: ' + currentBalance + ', delta: ' + delta + ')');
+    }
+
+    // Tulis balance baru
+    sheet.getRange(targetRow, balanceIdx + 1).setValue(newBalance);
+
+    const result = { ok: true, newBalance: newBalance, entityId: entityId, entityType: entityType };
+    storeIdempotency_(opId, result);
+    return result;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * D1 — Atomic Cash Ledger Append
+ * Menambah entri ke CashLedger dengan server-generated ID dan running balance.
+ *
+ * @param {Object} entry - { tanggal, ref, keterangan, kategori, debit, kredit, akun, metode }
+ * @param {string} opId - Idempotency key
+ * @returns {Object} { ok: true, id: string, saldo: number, entry: object }
+ * @throws {Error} Jika parameter tidak valid atau sheet tidak ditemukan
+ */
+function appendCashEntry(entry, opId) {
+  if (!entry || typeof entry !== 'object' || !opId) {
+    throw new Error('Parameter tidak valid: entry (object) dan opId wajib diisi.');
+  }
+  const requiredFields = ['tanggal', 'ref', 'keterangan', 'kategori', 'debit', 'kredit', 'akun', 'metode'];
+  for (const field of requiredFields) {
+    if (entry[field] === undefined || entry[field] === null || entry[field] === '') {
+      throw new Error('Field wajib kosong: ' + field);
+    }
+  }
+
+  // Cek idempotency
+  const cached = checkIdempotency_(opId);
+  if (cached) return cached;
+
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(15000);
+  } catch (e) {
+    throw new Error('Server sibuk. Coba lagi.');
+  }
+
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const cashSheet = ss.getSheetByName('CashLedger');
+    if (!cashSheet) throw new Error("Sheet 'CashLedger' tidak ditemukan.");
+
+    // Generate server-side ID
+    const newId = generateId_('CSH', cashSheet);
+
+    // Get last saldo for this akun
+    const previousSaldo = getLastSaldoForAkun_(cashSheet, entry.akun);
+    const debit = Number(entry.debit) || 0;
+    const kredit = Number(entry.kredit) || 0;
+    const saldo = previousSaldo + debit - kredit;
+
+    // Prepare row data
+    const rowData = {
+      id: newId,
+      tanggal: entry.tanggal,
+      ref: entry.ref,
+      keterangan: entry.keterangan,
+      kategori: entry.kategori,
+      debit: debit,
+      kredit: kredit,
+      saldo: saldo,
+      akun: entry.akun,
+      metode: entry.metode
+    };
+
+    appendRowFromObject_(cashSheet, rowData);
+
+    const result = { ok: true, id: newId, saldo: saldo, entry: rowData };
+    storeIdempotency_(opId, result);
+    return result;
+  } finally {
+    lock.releaseLock();
+  }
 }

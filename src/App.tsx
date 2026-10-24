@@ -13,14 +13,28 @@ import jsPDF from 'jspdf';
 import autoTable from 'jspdf-autotable';
 import * as htmlToImage from 'html-to-image';
 import { loginToServer, getSessionUser, logoutFromServer, hashPassword, type SessionUser } from './authService';
-import { getProducts, saveProduct, deleteProduct, saveAllProducts, sendEmailReport } from './dataService';
-import { getPurchaseOrders, savePurchaseOrder, deletePurchaseOrder, saveAllPurchaseOrders } from './dataService';
+import { getProducts, saveProduct, deleteProduct, saveAllProducts, sendEmailReport, adjustStock } from './dataService';
+import { getPurchaseOrders, savePurchaseOrder, deletePurchaseOrder, saveAllPurchaseOrders, adjustBalance } from './dataService';
 import { getCustomers, saveCustomer, deleteCustomer, saveAllCustomers } from "./dataService";
 import { getSuppliers, saveSupplier, deleteSupplier, saveAllSuppliers } from "./dataService";
 import { getOpnameLog, appendOpnameLog, saveAllOpnameLog } from "./dataService";
-import { getCashLedger, saveCashEntry, deleteCashEntry, saveAllCashLedger } from "./dataService";
+import { getCashLedger, saveCashEntry, deleteCashEntry, saveAllCashLedger, appendCashEntry } from "./dataService";
 import { getSalesOrders, saveSalesOrder, deleteSalesOrder, saveAllSalesOrders, fetchSettings, saveSettingsToGas, getBootstrapStatus, initialSetup } from './dataService';
 import { getConsignments, saveConsignment, deleteConsignment, saveAllConsignments } from './dataService';
+import { generateOpId, createCustomer, updateCustomer, createSupplier, updateSupplier, createPurchaseOrder, updatePurchaseOrder, createSalesOrder, updateSalesOrder, createCashEntry, updateCashEntry, createVoidLog, processRetur, voidDocument, getVoidLog } from './dataService';
+import {
+  canVoidDocument,
+  calculatePoVoidStockReversal,
+  calculateSoVoidStockReversal,
+  calculateVoidBalanceAdjustment,
+  calculateVoidCashReversal,
+  generateVoidLog,
+  canReturDocument,
+  calculateReturableQty,
+  calculateRetur,
+  updateItemQtyReturned,
+  calculateNewStatusAfterRetur
+} from './domain/voidRetur';
 import {
   ShoppingCart, LayoutDashboard,
   Package,
@@ -1218,7 +1232,7 @@ export default function App() {
   };
 
   // 1. Submit Receipt (Penerimaan PO)
-  const submitPoReceipt = (poId: string) => {
+  const submitPoReceipt = async (poId: string) => {
     let hasValidInput = false;
     let anyError = false;
 
@@ -1263,12 +1277,15 @@ export default function App() {
     setPurchaseOrders(nextPurchaseOrders);
     saveAllPurchaseOrders(nextPurchaseOrders);
 
-    const updatedProducts = products.map(p => {
-      const inputVal = poReceiptQtys[p.sku] ?? 0;
-      return inputVal > 0 ? { ...p, stok: p.stok + inputVal } : p;
-    });
-    setProducts(updatedProducts);
-    saveAllProducts(updatedProducts);
+    const opId = generateOpId();
+    for (const [sku, deltaQty] of Object.entries(poReceiptQtys)) {
+      if (deltaQty > 0) {
+        await adjustStock(sku, deltaQty, opId);
+      }
+    }
+    // Refresh products from server to get latest stock
+    const refreshedProducts = await getProducts();
+    setProducts(refreshedProducts);
 
     setSelectedPo(updatedPo);
     setPoActionForm(null);
@@ -1276,7 +1293,7 @@ export default function App() {
   };
 
   // 2. Submit Shipment (Pengiriman SO)
-  const submitSoShipment = (soId: string) => {
+  const submitSoShipment = async (soId: string) => {
     let hasValidInput = false;
     let anyError = false;
 
@@ -1326,14 +1343,18 @@ export default function App() {
     const nextSalesOrders = [...salesOrders];
     nextSalesOrders[soIndex] = updatedSo;
     setSalesOrders(nextSalesOrders);
-    saveAllSalesOrders(nextSalesOrders);
+    await saveAllSalesOrders(nextSalesOrders);
 
-    const updatedProducts = products.map(p => {
-      const inputVal = soShipmentQtys[p.sku] ?? 0;
-      return inputVal > 0 ? { ...p, stok: Math.max(0, p.stok - inputVal) } : p;
-    });
-    setProducts(updatedProducts);
-    saveAllProducts(updatedProducts);
+    // Adjust stock per SKU using delta ops
+    const opId = generateOpId();
+    for (const [sku, deltaQty] of Object.entries(soShipmentQtys)) {
+      if (deltaQty > 0) {
+        await adjustStock(sku, -deltaQty, opId); // negative delta for shipment
+      }
+    }
+    // Refresh products from server
+    const refreshedProducts = await getProducts();
+    setProducts(refreshedProducts);
 
     setSelectedSo(updatedSo);
     setSoActionForm(null);
@@ -1341,7 +1362,7 @@ export default function App() {
   };
 
   // 3. Submit PO Payment
-  const submitPoPayment = (poId: string) => {
+  const submitPoPayment = async (poId: string) => {
     if (poPaymentVal <= 0) return triggerToast('Nominal pembayaran tidak valid!', 'error');
 
     const poIndex = purchaseOrders.findIndex((p: any) => p.id === poId);
@@ -1359,40 +1380,62 @@ export default function App() {
     const updatedPaid = paid + poPaymentVal;
     const isLunas = updatedPaid >= po.grandTotal - 0.01;
 
-    const nextSuppliers = suppliers.map(s => s.nama === po.supplier ? { ...s, hutang: Math.max(0, s.hutang - poPaymentVal) } : s);
-    setSuppliers(nextSuppliers);
-    saveAllSuppliers(nextSuppliers);
+    // Find supplier ID
+    const supplier = suppliers.find(s => s.nama === po.supplier);
+    if (!supplier) {
+      triggerToast('Supplier tidak ditemukan!', 'error');
+      return;
+    }
 
-    const targetAkun = determineAccount(poPaymentMetode);
-    const accountTx = cashLedger.filter(c => (c.akun || 'Bank') === targetAkun);
-    const lastBal = accountTx.length > 0 ? accountTx[accountTx.length - 1].saldo : 0;
-    const nextCashLedger = [...cashLedger, {
-      id: `CSH-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`,
-      tanggal: new Date().toISOString().slice(0, 10),
-      ref: po.id,
-      keterangan: `Pembayaran Hutang ke Supplier ${po.supplier} [${po.id}]`,
-      kategori: 'Pembelian',
-      debit: 0,
-      kredit: poPaymentVal,
-      saldo: lastBal - poPaymentVal,
-      akun: targetAkun
-    }];
-    setCashLedger(nextCashLedger);
-    saveAllCashLedger(nextCashLedger);
+    const opId = generateOpId();
+    try {
+      // Adjust supplier hutang (decrease)
+      await adjustBalance('supplier', supplier.id, -poPaymentVal, opId);
 
-    const updatedPo = { ...po, totalPaid: updatedPaid, statusBayar: isLunas ? 'Lunas' : 'Cicilan' };
-    const nextPurchaseOrders = [...purchaseOrders];
-    nextPurchaseOrders[poIndex] = updatedPo;
-    setPurchaseOrders(nextPurchaseOrders);
-    saveAllPurchaseOrders(nextPurchaseOrders);
+      // Append cash ledger entry (kredit)
+      const targetAkun = determineAccount(poPaymentMetode);
+      await appendCashEntry({
+        tanggal: new Date().toISOString().slice(0, 10),
+        ref: po.id,
+        keterangan: `Pembayaran Hutang ke Supplier ${po.supplier} [${po.id}]`,
+        kategori: 'Pembelian',
+        debit: 0,
+        kredit: poPaymentVal,
+        akun: targetAkun,
+        metode: poPaymentMetode
+      }, opId);
 
-    setSelectedPo(updatedPo);
-    setPoActionForm(null);
-    triggerToast(`Pembayaran PO sebesar Rp ${poPaymentVal.toLocaleString('id-ID')} berhasil dicatat.`);
+      // Refresh suppliers and cash ledger from server
+      const [refreshedSuppliers, refreshedCashLedger] = await Promise.all([
+        getSuppliers(),
+        getCashLedger()
+      ]);
+      setSuppliers(refreshedSuppliers);
+      setCashLedger(refreshedCashLedger);
+
+      const updatedPo = { ...po, totalPaid: updatedPaid, statusBayar: isLunas ? 'Lunas' : 'Cicilan' };
+      const nextPurchaseOrders = [...purchaseOrders];
+      nextPurchaseOrders[poIndex] = updatedPo;
+      setPurchaseOrders(nextPurchaseOrders);
+      await saveAllPurchaseOrders(nextPurchaseOrders);
+
+      setSelectedPo(updatedPo);
+      setPoActionForm(null);
+      triggerToast(`Pembayaran PO sebesar Rp ${poPaymentVal.toLocaleString('id-ID')} berhasil dicatat.`);
+    } catch (err: any) {
+      triggerToast('Gagal mencatat pembayaran: ' + err.message, 'error');
+      // Rollback: refresh from server
+      const [refreshedSuppliers, refreshedCashLedger] = await Promise.all([
+        getSuppliers(),
+        getCashLedger()
+      ]);
+      setSuppliers(refreshedSuppliers);
+      setCashLedger(refreshedCashLedger);
+    }
   };
 
   // 4. Submit SO Payment (Pelunasan Piutang)
-  const submitSoPayment = (soId: string) => {
+  const submitSoPayment = async (soId: string) => {
     if (soPaymentVal <= 0) return triggerToast('Nominal pembayaran tidak valid!', 'error');
 
     const soIndex = salesOrders.findIndex((s: any) => s.id === soId);
@@ -1410,40 +1453,62 @@ export default function App() {
     const updatedPaid = paid + soPaymentVal;
     const isLunas = updatedPaid >= so.grandTotal - 0.01;
 
-    const nextCustomers = customers.map(c => c.nama === so.pelanggan ? { ...c, piutang: Math.max(0, c.piutang - soPaymentVal) } : c);
-    setCustomers(nextCustomers);
-    saveAllCustomers(nextCustomers);
+    // Find customer ID
+    const customer = customers.find(c => c.nama === so.pelanggan);
+    if (!customer) {
+      triggerToast('Pelanggan tidak ditemukan!', 'error');
+      return;
+    }
 
-    const targetAkun = determineAccount(soPaymentMetode);
-    const accountTx = cashLedger.filter(c => (c.akun || 'Bank') === targetAkun);
-    const lastBal = accountTx.length > 0 ? accountTx[accountTx.length - 1].saldo : 0;
-    const nextCashLedger = [...cashLedger, {
-      id: `CSH-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`,
-      tanggal: new Date().toISOString().slice(0, 10),
-      ref: so.id,
-      keterangan: `Penerimaan Pelunasan dari Pelanggan ${so.pelanggan} [${so.id}]`,
-      kategori: 'Penjualan',
-      debit: soPaymentVal,
-      kredit: 0,
-      saldo: lastBal + soPaymentVal,
-      akun: targetAkun
-    }];
-    setCashLedger(nextCashLedger);
-    saveAllCashLedger(nextCashLedger);
+    const opId = generateOpId();
+    try {
+      // Adjust customer piutang (decrease)
+      await adjustBalance('customer', customer.id, -soPaymentVal, opId);
 
-    const updatedSo = { ...so, totalPaid: updatedPaid, statusBayar: isLunas ? 'Lunas' : 'Cicilan' };
-    const nextSalesOrders = [...salesOrders];
-    nextSalesOrders[soIndex] = updatedSo;
-    setSalesOrders(nextSalesOrders);
-    saveAllSalesOrders(nextSalesOrders);
+      // Append cash ledger entry (debit)
+      const targetAkun = determineAccount(soPaymentMetode);
+      await appendCashEntry({
+        tanggal: new Date().toISOString().slice(0, 10),
+        ref: so.id,
+        keterangan: `Penerimaan Pelunasan dari Pelanggan ${so.pelanggan} [${so.id}]`,
+        kategori: 'Penjualan',
+        debit: soPaymentVal,
+        kredit: 0,
+        akun: targetAkun,
+        metode: soPaymentMetode
+      }, opId);
 
-    setSelectedSo(updatedSo);
-    setSoActionForm(null);
-    triggerToast(`Pelunasan piutang sebesar Rp ${soPaymentVal.toLocaleString('id-ID')} berhasil dicatat.`);
+      // Refresh customers and cash ledger from server
+      const [refreshedCustomers, refreshedCashLedger] = await Promise.all([
+        getCustomers(),
+        getCashLedger()
+      ]);
+      setCustomers(refreshedCustomers);
+      setCashLedger(refreshedCashLedger);
+
+      const updatedSo = { ...so, totalPaid: updatedPaid, statusBayar: isLunas ? 'Lunas' : 'Cicilan' };
+      const nextSalesOrders = [...salesOrders];
+      nextSalesOrders[soIndex] = updatedSo;
+      setSalesOrders(nextSalesOrders);
+      await saveAllSalesOrders(nextSalesOrders);
+
+      setSelectedSo(updatedSo);
+      setSoActionForm(null);
+      triggerToast(`Pelunasan piutang sebesar Rp ${soPaymentVal.toLocaleString('id-ID')} berhasil dicatat.`);
+    } catch (err: any) {
+      triggerToast('Gagal mencatat pelunasan: ' + err.message, 'error');
+      // Rollback: refresh from server
+      const [refreshedCustomers, refreshedCashLedger] = await Promise.all([
+        getCustomers(),
+        getCashLedger()
+      ]);
+      setCustomers(refreshedCustomers);
+      setCashLedger(refreshedCashLedger);
+    }
   };
 
   // 5. Submit PO Retur
-  const submitPoRetur = (poId: string) => {
+  const submitPoRetur = async (poId: string) => {
     let hasValidInput = false;
     let anyError = false;
 
@@ -1491,47 +1556,65 @@ export default function App() {
       return;
     }
 
-    const updatedProducts = products.map(p => {
-      const inputVal = poReturQtys[p.sku] ?? 0;
-      return inputVal > 0 ? { ...p, stok: Math.max(0, p.stok - inputVal) } : p;
-    });
-    setProducts(updatedProducts);
-    saveAllProducts(updatedProducts);
-
-    let totalReturValue = 0;
-    updatedItems.forEach((item: any) => {
-      const inputVal = poReturQtys[item.sku] ?? 0;
-      totalReturValue += inputVal * item.harga;
-    });
-
-    if (po.statusBayar === 'Belum Dibayar' || po.statusBayar === 'Cicilan') {
-      const nextSuppliers = suppliers.map(s => s.nama === po.supplier ? { ...s, hutang: Math.max(0, s.hutang - totalReturValue) } : s);
-      setSuppliers(nextSuppliers);
-      saveAllSuppliers(nextSuppliers);
-    }
-
-    const currentReturns = po.returItems || [];
-    const newReturns = [...currentReturns];
-    updatedItems.forEach((item: any) => {
-      const inputVal = poReturQtys[item.sku] ?? 0;
-      if (inputVal > 0) {
-        newReturns.push({ sku: item.sku, nama: item.nama, qty: inputVal, tanggal: new Date().toISOString().split('T')[0], alasan: poReturAlasan });
+    const opId = generateOpId();
+    try {
+      // Adjust stock per SKU (decrease for retur)
+      for (const [sku, deltaQty] of Object.entries(poReturQtys)) {
+        if (deltaQty > 0) {
+          await adjustStock(sku, -deltaQty, opId);
+        }
       }
-    });
+      // Refresh products
+      const refreshedProducts = await getProducts();
+      setProducts(refreshedProducts);
 
-    const updatedPo = { ...po, items: updatedItems, returItems: newReturns };
-    const nextPurchaseOrders = [...purchaseOrders];
-    nextPurchaseOrders[poIndex] = updatedPo;
-    setPurchaseOrders(nextPurchaseOrders);
-    saveAllPurchaseOrders(nextPurchaseOrders);
+      let totalReturValue = 0;
+      updatedItems.forEach((item: any) => {
+        const inputVal = poReturQtys[item.sku] ?? 0;
+        totalReturValue += inputVal * item.harga;
+      });
 
-    setSelectedPo(updatedPo);
-    setPoActionForm(null);
-    triggerToast('Retur Pembelian berhasil diproses. Stok gudang dikurangi & hutang supplier disesuaikan.');
+      if (po.statusBayar === 'Belum Dibayar' || po.statusBayar === 'Cicilan') {
+        const supplier = suppliers.find(s => s.nama === po.supplier);
+        if (supplier) {
+          await adjustBalance('supplier', supplier.id, -totalReturValue, opId);
+          const refreshedSuppliers = await getSuppliers();
+          setSuppliers(refreshedSuppliers);
+        }
+      }
+
+      const currentReturns = po.returItems || [];
+      const newReturns = [...currentReturns];
+      updatedItems.forEach((item: any) => {
+        const inputVal = poReturQtys[item.sku] ?? 0;
+        if (inputVal > 0) {
+          newReturns.push({ sku: item.sku, nama: item.nama, qty: inputVal, tanggal: new Date().toISOString().split('T')[0], alasan: poReturAlasan });
+        }
+      });
+
+      const updatedPo = { ...po, items: updatedItems, returItems: newReturns };
+      const nextPurchaseOrders = [...purchaseOrders];
+      nextPurchaseOrders[poIndex] = updatedPo;
+      setPurchaseOrders(nextPurchaseOrders);
+      await saveAllPurchaseOrders(nextPurchaseOrders);
+
+      setSelectedPo(updatedPo);
+      setPoActionForm(null);
+      triggerToast('Retur Pembelian berhasil diproses. Stok gudang dikurangi & hutang supplier disesuaikan.');
+    } catch (err: any) {
+      triggerToast('Gagal memproses retur: ' + err.message, 'error');
+      // Rollback: refresh from server
+      const [refreshedProducts, refreshedSuppliers] = await Promise.all([
+        getProducts(),
+        getSuppliers()
+      ]);
+      setProducts(refreshedProducts);
+      setSuppliers(refreshedSuppliers);
+    }
   };
 
   // 6. Submit SO Retur (Customer)
-  const submitSoRetur = (soId: string) => {
+  const submitSoRetur = async (soId: string) => {
     let hasValidInput = false;
     let anyError = false;
 
@@ -1572,43 +1655,61 @@ export default function App() {
       return;
     }
 
-    const updatedProducts = products.map(p => {
-      const inputVal = soReturQtys[p.sku] ?? 0;
-      return inputVal > 0 ? { ...p, stok: p.stok + inputVal } : p;
-    });
-    setProducts(updatedProducts);
-    saveAllProducts(updatedProducts);
-
-    let totalReturValue = 0;
-    updatedItems.forEach((item: any) => {
-      const inputVal = soReturQtys[item.sku] ?? 0;
-      totalReturValue += inputVal * item.harga;
-    });
-
-    if (so.statusBayar === 'Belum Lunas' || so.statusBayar === 'Cicilan') {
-      const nextCustomers = customers.map(c => c.nama === so.pelanggan ? { ...c, piutang: Math.max(0, c.piutang - totalReturValue) } : c);
-      setCustomers(nextCustomers);
-      saveAllCustomers(nextCustomers);
-    }
-
-    const currentReturns = so.returItems || [];
-    const newReturns = [...currentReturns];
-    updatedItems.forEach((item: any) => {
-      const inputVal = soReturQtys[item.sku] ?? 0;
-      if (inputVal > 0) {
-        newReturns.push({ sku: item.sku, nama: item.nama, qty: inputVal, tanggal: new Date().toISOString().split('T')[0], alasan: soReturAlasan });
+    const opId = generateOpId();
+    try {
+      // Adjust stock per SKU (increase for retur)
+      for (const [sku, deltaQty] of Object.entries(soReturQtys)) {
+        if (deltaQty > 0) {
+          await adjustStock(sku, deltaQty, opId);
+        }
       }
-    });
+      // Refresh products
+      const refreshedProducts = await getProducts();
+      setProducts(refreshedProducts);
 
-    const updatedSo = { ...so, items: updatedItems, returItems: newReturns };
-    const nextSalesOrders = [...salesOrders];
-    nextSalesOrders[soIndex] = updatedSo;
-    setSalesOrders(nextSalesOrders);
-    saveAllSalesOrders(nextSalesOrders);
+      let totalReturValue = 0;
+      updatedItems.forEach((item: any) => {
+        const inputVal = soReturQtys[item.sku] ?? 0;
+        totalReturValue += inputVal * item.harga;
+      });
 
-    setSelectedSo(updatedSo);
-    setSoActionForm(null);
-    triggerToast('Retur Penjualan berhasil diproses. Stok gudang ditambahkan & piutang customer disesuaikan.');
+      if (so.statusBayar === 'Belum Lunas' || so.statusBayar === 'Cicilan') {
+        const customer = customers.find(c => c.nama === so.pelanggan);
+        if (customer) {
+          await adjustBalance('customer', customer.id, -totalReturValue, opId);
+          const refreshedCustomers = await getCustomers();
+          setCustomers(refreshedCustomers);
+        }
+      }
+
+      const currentReturns = so.returItems || [];
+      const newReturns = [...currentReturns];
+      updatedItems.forEach((item: any) => {
+        const inputVal = soReturQtys[item.sku] ?? 0;
+        if (inputVal > 0) {
+          newReturns.push({ sku: item.sku, nama: item.nama, qty: inputVal, tanggal: new Date().toISOString().split('T')[0], alasan: soReturAlasan });
+        }
+      });
+
+      const updatedSo = { ...so, items: updatedItems, returItems: newReturns };
+      const nextSalesOrders = [...salesOrders];
+      nextSalesOrders[soIndex] = updatedSo;
+      setSalesOrders(nextSalesOrders);
+      await saveAllSalesOrders(nextSalesOrders);
+
+      setSelectedSo(updatedSo);
+      setSoActionForm(null);
+      triggerToast('Retur Penjualan berhasil diproses. Stok gudang ditambahkan & piutang customer disesuaikan.');
+    } catch (err: any) {
+      triggerToast('Gagal memproses retur: ' + err.message, 'error');
+      // Rollback: refresh from server
+      const [refreshedProducts, refreshedCustomers] = await Promise.all([
+        getProducts(),
+        getCustomers()
+      ]);
+      setProducts(refreshedProducts);
+      setCustomers(refreshedCustomers);
+    }
   };
 
   // 7. Approve PO (Draft -> Official)
@@ -1765,19 +1866,19 @@ export default function App() {
       const accountTx = cashLedger.filter(c => (c.akun || 'Bank') === targetAkun);
       const lastBal = accountTx.length > 0 ? accountTx[accountTx.length - 1].saldo : 0;
       const newBal = isKredit ? lastBal - manualCashForm.nominal : lastBal + manualCashForm.nominal;
-      const next = [...cashLedger, {
-        id: `CSH-${manualCashForm.tanggal.replace(/-/g, '')}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`,
+      const cashEntry = {
         tanggal: manualCashForm.tanggal,
-        ref: `MANUAL-${crypto.randomUUID().slice(0, 8).toUpperCase()}`,
+        ref: `MANUAL-${crypto.randomUUID().slice(0, 8).toUpperCase()}`, // ref can stay client-side
         keterangan: manualCashForm.keterangan,
         kategori: manualCashForm.kategori,
         debit: deb,
         kredit: kre,
         saldo: newBal,
         akun: targetAkun
-      }];
-      setCashLedger(next);
-      await saveAllCashLedger(next);
+      };
+      const result = await createCashEntry(cashEntry);
+      const newEntry = { ...cashEntry, id: result.id };
+      setCashLedger([...cashLedger, newEntry]);
 
       setShowManualCashModal(false);
       setManualCashForm({
@@ -2279,35 +2380,33 @@ export default function App() {
   // ==========================================
   // CUSTOMER / SUPPLIER LOGIC
   // ==========================================
-  const handleSaveCustomer = (e: React.FormEvent) => {
+  const handleSaveCustomer = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!customerForm.nama) return triggerToast('Nama wajib diisi!', 'error');
     if (isEditingCustomer) {
       setCustomers(customers.map(c => c.id === customerForm.id ? customerForm : c));
-      saveCustomer(customerForm);
+      await updateCustomer(customerForm);
       triggerToast('Customer terupdate.');
     } else {
-      const id = `CUST-${getTodayYMD()}-${crypto.randomUUID().slice(0, 4).toUpperCase()}`;
-      const newCust = { ...customerForm, id };
+      const result = await createCustomer(customerForm);
+      const newCust = { ...customerForm, id: result.id };
       setCustomers([...customers, newCust]);
-      saveCustomer(newCust);
       triggerToast('Customer terdaftar.');
     }
     setShowCustomerModal(false);
   };
 
-  const handleSaveSupplier = (e: React.FormEvent) => {
+  const handleSaveSupplier = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!supplierForm.nama) return triggerToast('Nama wajib diisi!', 'error');
     if (isEditingSupplier) {
       setSuppliers(suppliers.map(s => s.id === supplierForm.id ? supplierForm : s));
-      saveSupplier(supplierForm);
+      await updateSupplier(supplierForm);
       triggerToast('Supplier terupdate.');
     } else {
-      const id = `SUP-${getTodayYMD()}-${crypto.randomUUID().slice(0, 4).toUpperCase()}`;
-      const newSup = { ...supplierForm, id };
+      const result = await createSupplier(supplierForm);
+      const newSup = { ...supplierForm, id: result.id };
       setSuppliers([...suppliers, newSup]);
-      saveSupplier(newSup);
       triggerToast('Supplier terdaftar.');
     }
     setShowSupplierModal(false);
@@ -2983,18 +3082,16 @@ export default function App() {
       let currentSuppliers = [...suppliers];
       const existingSupplier = currentSuppliers.find(s => s.nama.toLowerCase() === rawSupplier.toLowerCase());
       if (!existingSupplier) {
-        const newSupId = `SUP-${getTodayYMD()}-${crypto.randomUUID().slice(0, 4).toUpperCase()}`;
-        const newSup = {
-          id: newSupId,
+        const result = await createSupplier({
           nama: rawSupplier,
           kontak: 'Auto-Created',
           email: 'auto@inoerp.com',
           telp: '-',
           alamat: 'Auto-Created via PO',
           hutang: 0
-        };
+        });
+        const newSup = { ...result, nama: rawSupplier }; // createSupplier returns { id }
         setSuppliers([...suppliers, newSup]);
-        await saveSupplier(newSup);
         currentSuppliers.push(newSup);
         triggerToast(`Supplier baru [${rawSupplier}] otomatis ditambahkan ke database!`, 'success');
       }
@@ -3006,10 +3103,11 @@ export default function App() {
       const tax = poForm.pajak ? Math.round(subtotal * 0.12) : 0;
       const grandTotal = subtotal + tax;
 
-      const finalId = isEditingPo ? poForm.id : `PO-${getTodayYMD()}-${crypto.randomUUID().slice(0, 4).toUpperCase()}`;
+      // const finalId = isEditingPo ? poForm.id : `PO-${getTodayYMD()}-${crypto.randomUUID().slice(0, 4).toUpperCase()}`;
+      // ID will be generated server-side for new POs
 
       const newPO = {
-        id: finalId,
+        id: isEditingPo ? poForm.id : null, // will be set by server for new POs
         tanggal: poForm.tanggal,
         supplier: poForm.supplier,
         metode: poForm.metode,
@@ -3030,33 +3128,46 @@ export default function App() {
       }
 
       // ponytail: Jika metode Tunai & bukan draft, catat pengeluaran kas langsung
+      let cashEntryId = null;
       if (!isDraft && poForm.metode === 'Tunai') {
         const targetAkun = 'Kas Tunai';
         const accountTx = cashLedger.filter(c => (c.akun || 'Bank') === targetAkun);
         const lastBal = accountTx.length > 0 ? accountTx[accountTx.length - 1].saldo : 0;
-        const nextLedger = [...cashLedger, {
-          id: `CSH-${poForm.tanggal.replace(/-/g, '')}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`,
+        const cashEntry = {
           tanggal: poForm.tanggal,
-          ref: finalId,
-          keterangan: `Pembelian Tunai ke Supplier ${poForm.supplier} [${finalId}]`,
+          ref: null, // will be set after PO is created
+          keterangan: `Pembelian Tunai ke Supplier ${poForm.supplier}`,
           kategori: 'Pembelian',
           debit: 0,
           kredit: grandTotal,
           saldo: lastBal - grandTotal,
           akun: targetAkun
-        }];
-        setCashLedger(nextLedger);
-        await saveAllCashLedger(nextLedger);
+        };
+        const result = await createCashEntry(cashEntry);
+        cashEntryId = result.id;
+        setCashLedger([...cashLedger, { ...cashEntry, id: cashEntryId }]);
       }
 
 
 
+      let savedPO;
       if (isEditingPo) {
+        await updatePurchaseOrder(newPO);
+        savedPO = newPO;
         setPurchaseOrders(purchaseOrders.map(p => p.id === poForm.id ? newPO : p));
-        await savePurchaseOrder(newPO);
       } else {
-        setPurchaseOrders([newPO, ...purchaseOrders]);
-        await savePurchaseOrder(newPO);
+        const result = await createPurchaseOrder(newPO);
+        savedPO = { ...newPO, id: result.id };
+        setPurchaseOrders([savedPO, ...purchaseOrders]);
+
+        // Update cash entry ref with the new PO ID
+        if (cashEntryId) {
+          const updatedCashLedger = cashLedger.map(c =>
+            c.id === cashEntryId ? { ...c, ref: result.id, keterangan: `Pembelian Tunai ke Supplier ${poForm.supplier} [${result.id}]` } : c
+          );
+          setCashLedger(updatedCashLedger);
+          await updateCashEntry(updatedCashLedger.find(c => c.id === cashEntryId)!);
+        }
       }
 
       triggerToast(isDraft ? 'Draft PO berhasil disimpan.' : 'PO resmi berhasil dirilis!');
@@ -3072,30 +3183,29 @@ export default function App() {
     if (window.confirm(`Yakin ingin membatalkan (Void) PO [${id}]?`)) {
       setIsVoidingPO(true);
       try {
-        const po = purchaseOrders.find(p => p.id === id);
-        if (po) {
-          // Adjust stock back down if it was already received
-          if (po.statusLogistik === 'Diterima') {
-            const updatedProds = products.map(p => {
-              const item = po.items.find((it: any) => it.sku === p.sku);
-              return item ? { ...p, stok: Math.max(0, p.stok - item.qty) } : p;
-            });
-            setProducts(updatedProds);
-            await saveAllProducts(updatedProds);
-          }
-          // Adjust payables
-          if (po.statusBayar === 'Belum Dibayar') {
-            const nextSups = suppliers.map(s => s.nama === po.supplier ? { ...s, hutang: Math.max(0, s.hutang - po.grandTotal) } : s);
-            setSuppliers(nextSups);
-            await saveAllSuppliers(nextSups);
-          }
-
-          const updatedPOs = purchaseOrders.map(p => p.id === id ? { ...p, statusLogistik: 'Void', statusBayar: 'Void' } : p);
-          setPurchaseOrders(updatedPOs);
-          await saveAllPurchaseOrders(updatedPOs);
-
-          triggerToast(`PO [${id}] berhasil dibatalkan.`);
+        // Use server-side voidDocument function for atomic void with audit trail
+        const result = await voidDocument('PO', id, window.prompt('Alasan void (opsional):') || 'Tidak ada alasan');
+        if (result.success) {
+          triggerToast(`PO [${id}] berhasil dibatalkan. (VoidLog: ${result.voidLogId})`);
+          // Refresh all related data
+          const [refreshedProducts, refreshedSuppliers, refreshedPOs] = await Promise.all([
+            getProducts(),
+            getSuppliers(),
+            getPurchaseOrders()
+          ]);
+          setProducts(refreshedProducts);
+          setSuppliers(refreshedSuppliers);
+          setPurchaseOrders(refreshedPOs);
         }
+      } catch (err: any) {
+        triggerToast('Gagal void PO: ' + err.message, 'error');
+        // Rollback: refresh from server
+        const [refreshedProducts, refreshedSuppliers] = await Promise.all([
+          getProducts(),
+          getSuppliers()
+        ]);
+        setProducts(refreshedProducts);
+        setSuppliers(refreshedSuppliers);
       } finally {
         setIsVoidingPO(false);
       }
@@ -3155,68 +3265,56 @@ export default function App() {
       triggerToast('Error: QTY dan Harga pada item tidak boleh negatif!', 'error');
       return;
     }
-    setIsSavingSO(true);
-    try {
 
-      // Auto-create new customer if it does not exist
-      const rawCustomer = soForm.pelanggan.trim();
-      let currentCustomers = [...customers];
-      const existingCustomer = currentCustomers.find(c => c.nama.toLowerCase() === rawCustomer.toLowerCase());
-      if (!existingCustomer) {
-        const newCustId = `CUST-${getTodayYMD()}-${crypto.randomUUID().slice(0, 4).toUpperCase()}`;
-        const newCust = {
-          id: newCustId,
-          nama: rawCustomer,
-          kontak: 'Auto-Created',
-          email: 'auto@inoerp.com',
-          telp: '-',
-          alamat: 'Auto-Created via SO',
-          piutang: 0
-        };
-        setCustomers([...customers, newCust]);
-        await saveCustomer(newCust);
-        currentCustomers.push(newCust);
-        triggerToast(`Pelanggan baru [${rawCustomer}] otomatis ditambahkan ke database!`, 'success');
-      }
+    // Auto-create new customer if it does not exist
+    const rawCustomer = soForm.pelanggan.trim();
+    let currentCustomers = [...customers];
+    const existingCustomer = currentCustomers.find(c => c.nama.toLowerCase() === rawCustomer.toLowerCase());
+    if (!existingCustomer) {
+      const result = await createCustomer({
+        nama: rawCustomer,
+        kontak: 'Auto-Created',
+        email: 'auto@inoerp.com',
+        telp: '-',
+        alamat: 'Auto-Created via SO',
+        piutang: 0
+      });
+      const newCust = { ...result, nama: rawCustomer };
+      setCustomers([...customers, newCust]);
+      currentCustomers.push(newCust);
+      triggerToast(`Pelanggan baru [${rawCustomer}] otomatis ditambahkan ke database!`, 'success');
+    }
 
-      const validItems = soForm.items.filter(item => item.sku && item.qty > 0);
-      if (validItems.length === 0) return triggerToast('Isi minimal 1 baris barang belanja!', 'error');
+    const validItems = soForm.items.filter(item => item.sku && item.qty > 0);
+    if (validItems.length === 0) return triggerToast('Isi minimal 1 baris barang belanja!', 'error');
 
-      // ponytail: Mitigasi client-side race condition (stale state). Solusi atomik definitif membutuhkan backend dengan database lock.
-      let freshProducts = products;
-      if (!isDraftMode) {
-        freshProducts = await getProducts();
-      }
+    // ponytail: Mitigasi client-side race condition (stale state). Solusi atomik definitif membutuhkan backend dengan database lock.
+    let freshProducts = products;
+    if (!isDraftMode) {
+      freshProducts = await getProducts();
+    }
 
-      // Check stocks before processing SO
-      let stockError = false;
-      if (!isDraftMode) {
-        validItems.forEach(item => {
-          const prod = freshProducts.find((p: any) => p.sku === item.sku);
-          if (!prod || prod.stok < item.qty) {
-            triggerToast(`Error: Stok berubah atau habis! Silakan periksa kembali (Sisa stok ${prod ? prod.nama : item.sku}: ${prod ? prod.stok : 0})`, 'error');
-            stockError = true;
-          }
-        });
-      }
-      if (stockError) return;
+    // Check stocks before processing SO
+    let stockError = false;
+    if (!isDraftMode) {
+      validItems.forEach(item => {
+        const prod = freshProducts.find((p: any) => p.sku === item.sku);
+        if (!prod || prod.stok < item.qty) {
+          triggerToast(`Error: Stok berubah atau habis! Silakan periksa kembali (Sisa stok ${prod ? prod.nama : item.sku}: ${prod ? prod.stok : 0})`, 'error');
+          stockError = true;
+        }
+      });
+    }
+    if (stockError) return;
 
-      const subtotal = validItems.reduce((sum, item) => sum + item.subtotal, 0);
-      const tax = soForm.pajak ? Math.round(subtotal * 0.12) : 0;
-      const grandTotal = subtotal + tax;
+    const subtotal = validItems.reduce((sum, item) => sum + item.subtotal, 0);
+    const tax = soForm.pajak ? Math.round(subtotal * 0.12) : 0;
+    const grandTotal = subtotal + tax;
 
-      // Deduct Stock
-      if (!isDraftMode) {
-        const updatedProds = freshProducts.map((p: any) => {
-          const cartItem = validItems.find(item => item.sku === p.sku);
-          return cartItem ? { ...p, stok: p.stok - cartItem.qty } : p;
-        });
-        setProducts(updatedProds);
-        await saveAllProducts(updatedProds);
-      }
-
-      const nextId = isEditingSo ? soForm.id : `SO-${getTodayYMD()}-${crypto.randomUUID().slice(0, 4).toUpperCase()}`;
-      const newSO = {
+    // const nextId = isEditingSo ? soForm.id : `SO-${getTodayYMD()}-${crypto.randomUUID().slice(0, 4).toUpperCase()}`;
+    // ID will be generated server-side for new SOs
+    let nextId = isEditingSo ? soForm.id : null;
+    const newSO = {
         id: nextId,
         tanggal: soForm.tanggal,
         pelanggan: soForm.pelanggan,
@@ -3231,48 +3329,74 @@ export default function App() {
         catatan: soForm.catatan || 'Sales Order'
       };
 
-      if (isEditingSo) {
-        setSalesOrders(salesOrders.map(so => so.id === soForm.id ? newSO : so));
-        await saveSalesOrder(newSO);
-        triggerToast(`Sales Order [${soForm.id}] berhasil diupdate.`);
-      } else {
-        setSalesOrders([newSO, ...salesOrders]);
-        await saveSalesOrder(newSO);
-        triggerToast(`Sales Order [${nextId}] berhasil dibuat & rilis!`);
-      }
+      setIsSavingSO(true);
+      const opId = generateOpId();
+      try {
+        // Deduct Stock per SKU using delta ops
+        if (!isDraftMode) {
+          for (const item of validItems) {
+            await adjustStock(item.sku, -item.qty, opId);
+          }
+          const refreshedProducts = await getProducts();
+          setProducts(refreshedProducts);
+        }
 
-      // Update customer piutang
-      if (soForm.metode !== 'Tunai' && !isDraftMode) {
-        const nextCusts = customers.map(c => c.nama === soForm.pelanggan ? { ...c, piutang: c.piutang + grandTotal } : c);
-        setCustomers(nextCusts);
-        await saveAllCustomers(nextCusts);
-      }
+        let savedSO;
+        if (isEditingSo) {
+          await updateSalesOrder(newSO);
+          savedSO = newSO;
+          setSalesOrders(salesOrders.map(so => so.id === soForm.id ? newSO : so));
+          triggerToast(`Sales Order [${soForm.id}] berhasil diupdate.`);
+        } else {
+          const result = await createSalesOrder(newSO);
+          savedSO = { ...newSO, id: result.id };
+          nextId = result.id;
+          setSalesOrders([savedSO, ...salesOrders]);
+          triggerToast(`Sales Order [${result.id}] berhasil dibuat & rilis!`);
+        }
 
-      // ponytail: Jika metode Tunai & bukan draft, catat penerimaan kas langsung
-      if (soForm.metode === 'Tunai' && !isDraftMode) {
-        const targetAkun = 'Kas Tunai';
-        const accountTx = cashLedger.filter(c => (c.akun || 'Bank') === targetAkun);
-        const lastBal = accountTx.length > 0 ? accountTx[accountTx.length - 1].saldo : 0;
-        const nextLedger = [...cashLedger, {
-          id: `CSH-${soForm.tanggal.replace(/-/g, '')}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`,
-          tanggal: soForm.tanggal,
-          ref: nextId,
-          keterangan: `Penjualan Tunai dari ${soForm.pelanggan} [${nextId}]`,
-          kategori: 'Penjualan',
-          debit: grandTotal,
-          kredit: 0,
-          saldo: lastBal + grandTotal,
-          akun: targetAkun
-        }];
-        setCashLedger(nextLedger);
-        await saveAllCashLedger(nextLedger);
-      }
+        // Update customer piutang (for non-cash)
+        if (soForm.metode !== 'Tunai' && !isDraftMode) {
+          const customer = customers.find(c => c.nama === soForm.pelanggan);
+          if (customer) {
+            await adjustBalance('customer', customer.id, grandTotal, opId);
+            const refreshedCustomers = await getCustomers();
+            setCustomers(refreshedCustomers);
+          }
+        }
 
-      setShowSoForm(false);
-      setIsEditingSo(false);
-    } finally {
-      setIsSavingSO(false);
-    }
+        // Cash ledger entry for cash sales
+        if (soForm.metode === 'Tunai' && !isDraftMode) {
+          await appendCashEntry({
+            tanggal: soForm.tanggal,
+            ref: nextId,
+            keterangan: `Penjualan Tunai dari ${soForm.pelanggan} [${nextId}]`,
+            kategori: 'Penjualan',
+            debit: grandTotal,
+            kredit: 0,
+            akun: 'Kas Tunai',
+            metode: 'Tunai'
+          }, opId);
+          const refreshedCashLedger = await getCashLedger();
+          setCashLedger(refreshedCashLedger);
+        }
+
+        setShowSoForm(false);
+        setIsEditingSo(false);
+      } catch (err: any) {
+        triggerToast('Gagal menyimpan Sales Order: ' + err.message, 'error');
+        // Rollback: refresh from server
+        const [refreshedProducts, refreshedCustomers, refreshedCashLedger] = await Promise.all([
+          getProducts(),
+          getCustomers(),
+          getCashLedger()
+        ]);
+        setProducts(refreshedProducts);
+        setCustomers(refreshedCustomers);
+        setCashLedger(refreshedCashLedger);
+      } finally {
+        setIsSavingSO(false);
+      }
   };
 
   const handleVoidSO = async (id: string) => {
@@ -3283,32 +3407,175 @@ export default function App() {
     if (window.confirm(`Void Sales Order ${id}? Tindakan ini akan mengembalikan stok barang ke gudang.`)) {
       setIsVoidingSO(true);
       try {
-        // Revert Stock
-        const updatedProducts = products.map(p => {
-          const orderItem = so.items.find((item: any) => item.sku === p.sku);
-          if (orderItem && so.statusLogistik !== 'Void') {
-            return { ...p, stok: p.stok + orderItem.qty };
-          }
-          return p;
-        });
-        setProducts(updatedProducts);
-        await saveAllProducts(updatedProducts);
-
-        // Decrement piutang if applicable
-        if (so.statusBayar === 'Belum Lunas') {
-          const nextCusts = customers.map(c => c.nama === so.pelanggan ? { ...c, piutang: Math.max(0, c.piutang - so.grandTotal) } : c);
-          setCustomers(nextCusts);
-          await saveAllCustomers(nextCusts);
+        // Use server-side voidDocument function for atomic void with audit trail
+        const result = await voidDocument('SO', id, window.prompt('Alasan void (opsional):') || 'Tidak ada alasan');
+        if (result.success) {
+          triggerToast(`Struk ${id} berhasil di-Void! Stok dikembalikan. (VoidLog: ${result.voidLogId})`);
+          // Refresh all related data
+          const [refreshedProducts, refreshedCustomers, refreshedSOs] = await Promise.all([
+            getProducts(),
+            getCustomers(),
+            getSalesOrders()
+          ]);
+          setProducts(refreshedProducts);
+          setCustomers(refreshedCustomers);
+          setSalesOrders(refreshedSOs);
         }
-
-        const updatedSOs = salesOrders.map(item => item.id === id ? { ...item, statusBayar: 'Void', statusLogistik: 'Void' } : item);
-        setSalesOrders(updatedSOs);
-        await saveAllSalesOrders(updatedSOs);
-
-        triggerToast(`Struk ${id} berhasil di-Void! Stok dikembalikan.`);
+      } catch (err: any) {
+        triggerToast('Gagal void Sales Order: ' + err.message, 'error');
+        // Rollback: refresh from server
+        const [refreshedProducts, refreshedCustomers] = await Promise.all([
+          getProducts(),
+          getCustomers()
+        ]);
+        setProducts(refreshedProducts);
+        setCustomers(refreshedCustomers);
       } finally {
         setIsVoidingSO(false);
       }
+    }
+  };
+
+  // ==========================================
+  // RETUR LOGIC (D6)
+  // ==========================================
+
+  const handleReturPO = async (id: string) => {
+    if (isVoidingPO) return;
+    const po = purchaseOrders.find(p => p.id === id);
+    if (!po) return triggerToast('PO tidak ditemukan', 'error');
+
+    // Validate retur eligibility using domain function
+    const returValidation = canReturDocument(po.statusLogistik, po.statusBayar);
+    if (!returValidation.allowed) {
+      return triggerToast(`Tidak bisa retur: ${returValidation.reason}`, 'error');
+    }
+
+    // Get returable items
+    const returableItems = calculateReturableQty(
+      po.items.map(item => ({
+        sku: item.sku,
+        nama: item.nama,
+        qty: item.qty,
+        qtyReceived: item.qtyReceived,
+        qtyReturned: item.qtyReturned || 0,
+        harga: item.harga,
+        hpp: item.hpp
+      }))
+    );
+
+    if (returableItems.length === 0) {
+      return triggerToast('Tidak ada item yang bisa di-retur', 'error');
+    }
+
+    // For now, show a simple prompt for retur items
+    // In production, this would be a modal with item selection
+    const returnItemsInput = window.prompt(
+      `Retur PO [${id}]\nItem yang bisa di-retur:\n${returableItems.map(i => `${i.sku} (${i.nama}): max ${i.qtyMax}`).join('\n')}\n\nMasukkan format: SKU1:qty,SKU2:qty\nContoh: SKU001:2,SKU002:1`
+    );
+
+    if (!returnItemsInput) return;
+
+    try {
+      const returnItems = returnItemsInput.split(',').map(s => {
+        const [sku, qty] = s.trim().split(':');
+        return { sku, qty: parseInt(qty) || 0 };
+      }).filter(r => r.qty > 0);
+
+      if (returnItems.length === 0) return triggerToast('Tidak ada item valid untuk di-retur', 'error');
+
+      setIsVoidingPO(true);
+      const result = await processRetur({
+        docType: 'PO',
+        docId: id,
+        returnItems,
+        alasan: window.prompt('Alasan retur (opsional):') || 'Retur barang'
+      });
+
+      if (result.success) {
+        triggerToast(`Retur PO [${id}] berhasil. Total refund: Rp ${result.totalRefund.toLocaleString('id-ID')}`);
+        const [refreshedProducts, refreshedSuppliers, refreshedPOs] = await Promise.all([
+          getProducts(),
+          getSuppliers(),
+          getPurchaseOrders()
+        ]);
+        setProducts(refreshedProducts);
+        setSuppliers(refreshedSuppliers);
+        setPurchaseOrders(refreshedPOs);
+      }
+    } catch (err: any) {
+      triggerToast('Gagal retur PO: ' + err.message, 'error');
+    } finally {
+      setIsVoidingPO(false);
+    }
+  };
+
+  const handleReturSO = async (id: string) => {
+    if (isVoidingSO) return;
+    const so = salesOrders.find(s => s.id === id);
+    if (!so) return triggerToast('SO tidak ditemukan', 'error');
+
+    // Validate retur eligibility using domain function
+    const returValidation = canReturDocument(so.statusLogistik, so.statusBayar);
+    if (!returValidation.allowed) {
+      return triggerToast(`Tidak bisa retur: ${returValidation.reason}`, 'error');
+    }
+
+    // Get returable items
+    const returableItems = calculateReturableQty(
+      so.items.map(item => ({
+        sku: item.sku,
+        nama: item.nama,
+        qty: item.qty,
+        qtyShipped: item.qtyShipped,
+        qtyReturned: item.qtyReturned || 0,
+        harga: item.harga,
+        hpp: item.hpp
+      }))
+    );
+
+    if (returableItems.length === 0) {
+      return triggerToast('Tidak ada item yang bisa di-retur', 'error');
+    }
+
+    // For now, show a simple prompt for retur items
+    const returnItemsInput = window.prompt(
+      `Retur SO [${id}]\nItem yang bisa di-retur:\n${returableItems.map(i => `${i.sku} (${i.nama}): max ${i.qtyMax}`).join('\n')}\n\nMasukkan format: SKU1:qty,SKU2:qty\nContoh: SKU001:2,SKU002:1`
+    );
+
+    if (!returnItemsInput) return;
+
+    try {
+      const returnItems = returnItemsInput.split(',').map(s => {
+        const [sku, qty] = s.trim().split(':');
+        return { sku, qty: parseInt(qty) || 0 };
+      }).filter(r => r.qty > 0);
+
+      if (returnItems.length === 0) return triggerToast('Tidak ada item valid untuk di-retur', 'error');
+
+      setIsVoidingSO(true);
+      const result = await processRetur({
+        docType: 'SO',
+        docId: id,
+        returnItems,
+        alasan: window.prompt('Alasan retur (opsional):') || 'Retur barang'
+      });
+
+      if (result.success) {
+        triggerToast(`Retur SO [${id}] berhasil. Total refund: Rp ${result.totalRefund.toLocaleString('id-ID')}`);
+        const [refreshedProducts, refreshedCustomers, refreshedSOs] = await Promise.all([
+          getProducts(),
+          getCustomers(),
+          getSalesOrders()
+        ]);
+        setProducts(refreshedProducts);
+        setCustomers(refreshedCustomers);
+        setSalesOrders(refreshedSOs);
+      }
+    } catch (err: any) {
+      triggerToast('Gagal retur SO: ' + err.message, 'error');
+    } finally {
+      setIsVoidingSO(false);
     }
   };
 
@@ -5758,6 +6025,7 @@ export default function App() {
               setSelectedPo={setSelectedPo}
               setPoActionForm={setPoActionForm}
               handleVoidPO={handleVoidPO}
+              handleReturPO={handleReturPO}
               handlePoItemChange={handlePoItemChange}
               handleRemovePoItem={handleRemovePoItem}
               handleAddPoItem={handleAddPoItem}
@@ -5787,6 +6055,7 @@ export default function App() {
               handleAddSoItem={handleAddSoItem}
               handleSaveSalesOrder={handleSaveSalesOrder}
               handleVoidSO={handleVoidSO}
+              handleReturSO={handleReturSO}
               isSavingSO={isSavingSO}
             />
           )}
@@ -9465,7 +9734,6 @@ export default function App() {
           </div>
         </div>
       )}
-
     </div>
   );
 }
