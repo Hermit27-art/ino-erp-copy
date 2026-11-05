@@ -1,0 +1,19 @@
+CARA PASANG (hapus berkas ini setelah selesai)
+
+Tempel ke AKAR proyek (folder yang berisi package.json, Code_ERP.gs, PRD_INO_ERP_Antigravity.md):
+
+1. CLAUDE.md      -> akar proyek (berkas baru).
+2. docs/          -> akar proyek (folder baru; jika sudah ada, gabungkan isinya).
+3. AGENTS.md      -> akar proyek. SUDAH ADA di proyek Anda: simpan dulu salinan lama,
+                     lalu timpa. Isinya sama dengan yang lama + 2 baris tambahan
+                     (multi-cabang dan rujukan ke docs/). Jika AGENTS.md Anda sudah
+                     berubah sejak Anda mengirim zip proyek, jangan timpa: tambahkan
+                     2 baris itu secara manual (cari kata "multi-business" dan
+                     "Multi-branch scope" di berkas ini).
+
+Siapa membaca apa:
+- Claude Code : CLAUDE.md (otomatis), lalu docs/ sesuai urutan di dalamnya.
+- Codex/ChatGPT: docs/DESIGN_BRIEF.md (+ AGENTS.md).
+- Antigravity : AGENTS.md, docs/PRD_ADDENDUM_M1.md (peran: penilai, bukan pembangun).
+
+Jangan commit ke produksi. Semua kerja memakai salinan Sheet uji.

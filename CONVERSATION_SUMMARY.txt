@@ -1,0 +1,82 @@
+INO ERP → Supabase Migration — Conversation Summary
+====================================================
+Date: 24 Oct 2026
+Branch: migration-supabase
+Repo: D:\Downloads\ino-erp (10) - Copy
+
+--------------------------------------------------------
+PROJECT CONTEXT
+--------------------------------------------------------
+Goal: Migrate INO ERP from Google Sheets/Apps Script to Supabase/Vercel
+Pipeline: JeKing CSV → Go exe (Win7/386, stdlib only) → Supabase RPC → React (Vercel)
+
+Key Principle: Go output NOT guaranteed correct → Audit trail = truth
+- No hard deletes (void/aktif flag)
+- GL append-only (edits = reversal + new entry)
+- All mutations via RPC with SET LOCAL app.audit_reason
+- service_role never in frontend/Go exe
+
+--------------------------------------------------------
+WHAT WAS DONE ✅
+--------------------------------------------------------
+1. NEW PRD v2.1 created: PRD_INO_ERP_Antigravity.md
+   - Phases: 0 (Win7 PoC), 1 (Schema), 2 (Go exe), 3 (React swap)
+   - Decision Log DEC-01 to DEC-10
+   - File retention/deletion list
+
+2. AGENTS.md updated for new scope
+   - Supabase/RLS/audit/Go constraints
+   - Removed GAS-specific rules
+
+3. Phase 1 Migration created: supabase/migrations/20261024000000_initial_schema.sql
+   Tables: cabang, coa, produk, pelanggan, supplier, metode_bayar
+          tx_header, tx_item, po_header, po_item, cash_ledger
+          gl_entry (append-only), audit_log, ingest_conflict
+   Triggers: Universal audit (enforces audit_reason), GL auto-post
+   RPC: ingest_jeking (ingestor role, idempotent+conflict), create_tx_manual,
+        void_tx, create_cash_manual, Settings CRUD
+   Views: v_gl_balance, v_trial_balance, v_pl, v_stock_on_hand
+
+4. Committed to git:
+   - d95a7e9: PRD fix
+   - d835c6a: Phase 1 migration
+
+5. REPORT_PHASE1.md created documenting status
+
+--------------------------------------------------------
+BLOCKER 🚫
+--------------------------------------------------------
+Docker not installed → supabase start fails
+- Cannot install Docker Desktop (needs admin rights)
+- Cannot run local Supabase, apply migration, or verify RPC/trigger/RLS
+- Phase 0 (Go exe on real Win7 PC) depends on Supabase RPC being live
+
+--------------------------------------------------------
+TO RESUME WHEN WIN7 AVAILABLE
+--------------------------------------------------------
+1. Install Docker Desktop (Run as Administrator)
+2. cd "D:/Downloads/ino-erp (10) - Copy"
+3. supabase start
+4. supabase migration up
+5. In Supabase Dashboard SQL Editor, create ingestor role:
+   CREATE ROLE ingestor NOINHERIT;
+   GRANT USAGE ON SCHEMA public TO ingestor;
+   GRANT SELECT, INSERT ON tx_header, tx_item, cash_ledger, ingest_conflict TO ingestor;
+   GRANT SELECT ON cabang, pelanggan, produk, metode_bayar TO ingestor;
+   GRANT EXECUTE ON FUNCTION ingest_jeking(jsonb) TO ingestor;
+6. Test: psql -c "SELECT ingest_jeking('{\"external_ref\":\"test-1\",...}')"
+7. Then Phase 0: Build Go exe, test on REAL Win7 PC kasir (not VM)
+
+--------------------------------------------------------
+KEY FILES TO REFERENCE
+--------------------------------------------------------
+- PRD_INO_ERP_Antigravity.md — Full spec
+- AGENTS.md — Agent rules
+- supabase/migrations/20261024000000_initial_schema.sql — Complete schema
+- REPORT_PHASE1.md — Detailed blocker report
+
+--------------------------------------------------------
+OUT OF SCOPE (per PRD)
+--------------------------------------------------------
+POS UI, GAS backend, konsinyasi, multi-cabang, historical backfill,
+direct .mdb access, Windows Service, HR/CRM
